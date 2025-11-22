@@ -1,0 +1,7 @@
+python-dotenv==1.0.1
+inference-sdk
+inference-cli
+uvicorn[standard]==0.24.0
+requests
+fastapi==0.104.1
+BytesIO

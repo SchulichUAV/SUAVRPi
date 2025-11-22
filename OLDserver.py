@@ -1,7 +1,5 @@
-
 # Buit to sync with GCS2025 in Schulich UAV repository/organization
 # Built for Raspberry Pi 5 (Linux OS)
-
 from picamera2 import Picamera2, Preview
 from flask import Flask, jsonify, request, Response
 from flask_cors import CORS

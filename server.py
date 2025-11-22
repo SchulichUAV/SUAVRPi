@@ -1,9 +1,56 @@
-
+# main.py
+import uvicorn, asyncio
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-import uvicorn, asyncio, json
+from fastapi import FastAPI
+from contextlib import asynccontextmanager
 
-app = FastAPI()
+from routes_http import router as http_router
+from shared_state import vehicle_data, update_kit, update_vehicle_connection
+
+from modules.AutopilotDevelopment.General.Operations.initialize import connect_to_vehicle, verify_connection
+from adafruit_servokit import ServoKit
+import threading
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    print("Initializing ServoKit...")
+    kit_obj = ServoKit(channels=16)
+    update_kit(kit_obj)
+
+    print("Connecting to vehicle...")
+    conn = connect_to_vehicle("udp:127.0.0.1:5006")
+    if not verify_connection(conn):
+        raise RuntimeError("Vehicle connection failed verification.")
+    update_vehicle_connection(conn)
+
+    print("Starting vehicle position thread...")
+    def receive_vehicle_position():
+        import socket
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind(("127.0.0.1", 5005))
+
+        while True:
+            data = sock.recvfrom(1024)
+            items = data[0].decode()[1:-1].split(",")
+            timestamp = float(items[0])
+
+            if timestamp <= vehicle_data["last_time"]:
+                continue
+
+            if len(items) == len(vehicle_data):
+                vehicle_data["last_time"] = timestamp
+                for i, key in enumerate(list(vehicle_data.keys())[1:], start=1):
+                    vehicle_data[key] = float(items[i])
+
+    pos_thread = threading.Thread(target=receive_vehicle_position, daemon=True)
+    pos_thread.start()
+    yield
+
+
+#   APP DEFINITION
+app = FastAPI(lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -13,6 +60,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+app.include_router(http_router)
+
+#   WEBSOCKET MANAGER
 class ConnectionManager:
     def __init__(self):
         self.active_connections: list[WebSocket] = []
@@ -30,43 +80,23 @@ class ConnectionManager:
         for ws in list(self.active_connections):
             try:
                 await ws.send_json(message)
-            except Exception:
+            except:
                 self.disconnect(ws)
+
 
 manager = ConnectionManager()
 
+#   WEBSOCKET ENDPOINT
 @app.websocket("/ws/rpi")
-async def rpi_ws(websocket: WebSocket):
+async def websocket_rpi(websocket: WebSocket):
     await manager.connect(websocket)
     try:
         while True:
             await asyncio.sleep(1)
-            vehicle_data = {
-                "last_time": 0,
-                "lat": 123.2323,
-                "lon": -124.23442,
-                "rel_alt": 0,
-                "alt": 2323,
-                "roll": 24.23,
-                "pitch": 0,
-                "yaw": 0,
-                "dlat": 0,
-                "dlon": 0,
-                "dalt": 0,
-                "heading": 0,
-                "groundspeed": 54,
-                "throttle": 0,
-                "climb": 0,
-                "flight_mode": 0,
-                "battery_voltage": 43.64,
-                "battery_current": 0,
-                "battery_remaining": 44.5,
-                "is_dropped": False
-            }
             await manager.broadcast(vehicle_data)
     except WebSocketDisconnect:
         manager.disconnect(websocket)
 
+
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8888)
-
