@@ -369,6 +369,34 @@ def receive_vehicle_position():  # Actively runs and receives live vehicle data 
         else:
             print(f"Received data item does not match expected length...")
 
+
+'''
+#Recieve waypoints from GCS:
+
+@app.route("/receive_waypoints", methods=["POST"])
+def receive_waypoints():
+    try:
+        json_data = request.json
+        waypoint_list_of_dicts = json_data['Waypoints']
+    except Exception as e:
+        print(f"Error receiving mission. Error: {e}")
+        return jsonify({'error': "Invalid operation."}), 400
+    return jsonify({'success': True, "error": None}), 200
+'''
+
+### Send Waypoints to Ardupilot:
+@app.route("/send-waypoints", methods=["POST"])
+def send_waypoints():
+    try:
+        json_data = request.json
+        waypoints = json_data['waypoints']
+        mission.upload_mission_waypoints(vehicle_connection, waypoints)
+        print("Mission successfully uploaded.")
+        return jsonify({'message': 'Mission uploaded successfully.'}), 200
+    except Exception as e:
+        print(f"Error uploading mission. Error: {e}")
+        return jsonify({'error': "Invalid operation."}), 400
+
 if __name__ == "__main__":
     # Need to take a parameter off of the command line to determine if we are a plane or copter 
     kit = ServoKit(channels=16)
