@@ -339,6 +339,18 @@ def take_picture(image_number, picam2):
 
     return time.time() - start_time
 
+@app.route("/send-waypoints", methods=["POST"])
+def send_waypoints():
+    try:
+        json_data = request.json
+        waypoints = json_data['waypoints']
+        mission.upload_mission_waypoints(vehicle_connection, waypoints)
+        print("Mission successfully uploaded.")
+        return jsonify({'message': 'Mission uploaded successfully.'}), 200
+    except Exception as e:
+        print(f"Error uploading mission. Error: {e}")
+        return jsonify({'error': "Invalid operation."}), 400
+
 @app.route("/heartbeat-validate")
 def heartbeat_validate():
     # vehicle_data is being continuously updated by a separate thread
