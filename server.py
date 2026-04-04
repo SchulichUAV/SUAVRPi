@@ -376,7 +376,7 @@ def send_waypoints():
     try:
         json_data = request.json
         waypoints = json_data['waypoints']
-        best_waypoints = find_best.find_best_waypoint_sequence(waypoints)
+        best_waypoints = find_best.run_mission_pathfinding(waypoints)
         mission.upload_mission_waypoints(vehicle_connection, best_waypoints)
         print("Mission successfully uploaded.")
         return jsonify({'message': 'Mission uploaded successfully.'}), 200
