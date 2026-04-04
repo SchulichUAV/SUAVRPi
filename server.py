@@ -21,6 +21,7 @@ import RPi.GPIO as GPIO
 import modules.AutopilotDevelopment.General.Operations.initialize as initialize
 import modules.AutopilotDevelopment.General.Operations.mode as autopilot_mode
 import modules.AutopilotDevelopment.General.Operations.mission as mission
+import modules.AutopilotDevelopment.General.Operations.mission_pathfinding as find_best
 import modules.AutopilotDevelopment.Plane.Operations.altitude as autopilot_altitude
 import modules.payload as payload
 
@@ -369,33 +370,21 @@ def receive_vehicle_position():  # Actively runs and receives live vehicle data 
         else:
             print(f"Received data item does not match expected length...")
 
-
-'''
-#Recieve waypoints from GCS:
-
-@app.route("/receive_waypoints", methods=["POST"])
-def receive_waypoints():
-    try:
-        json_data = request.json
-        waypoint_list_of_dicts = json_data['Waypoints']
-    except Exception as e:
-        print(f"Error receiving mission. Error: {e}")
-        return jsonify({'error': "Invalid operation."}), 400
-    return jsonify({'success': True, "error": None}), 200
-'''
-
-### Send Waypoints to Ardupilot:
-@app.route("/send-waypoints", methods=["POST"])
+### Recieve and Send Waypoints to Ardupilot:
+@app.route("/recieve_send_waypoints", methods=["POST"])
 def send_waypoints():
     try:
         json_data = request.json
         waypoints = json_data['waypoints']
-        mission.upload_mission_waypoints(vehicle_connection, waypoints)
+        best_waypoints = find_best.find_best_waypoint_sequence(waypoints)
+        mission.upload_mission_waypoints(vehicle_connection, best_waypoints)
         print("Mission successfully uploaded.")
         return jsonify({'message': 'Mission uploaded successfully.'}), 200
     except Exception as e:
         print(f"Error uploading mission. Error: {e}")
         return jsonify({'error': "Invalid operation."}), 400
+
+
 
 if __name__ == "__main__":
     # Need to take a parameter off of the command line to determine if we are a plane or copter 
