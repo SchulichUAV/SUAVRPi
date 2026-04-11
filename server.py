@@ -1,13 +1,11 @@
 # Buit to sync with GCS2025 in Schulich UAV repository/organization
 # Built for Raspberry Pi 5 (Linux OS)
 
-from flask import Flask, jsonify, request, Response
+from flask import Flask, jsonify, request
 from flask_cors import CORS
-from math import ceil
-from adafruit_servokit import ServoKit
 import cv2
-import requests
 import threading
+import queue
 import socket
 import ctypes
 import fcntl
@@ -15,10 +13,6 @@ import json
 import sys
 import time
 import os
-from io import BytesIO
-from os import path
-import argparse
-import threading
 
 # import modules.AutopilotDevelopment.General.Operations.initialize as initialize
 # import modules.AutopilotDevelopment.General.Operations.mode as autopilot_mode
@@ -99,6 +93,8 @@ vehicle_data = {
     "battery_current": 0,
     "battery_remaining": 0,
 }
+vehicle_data_lock = threading.Lock()
+_vehicle_keys = list(vehicle_data.keys())[1:]
 
 @app.route('/set_flight_mode', methods=["POST"])
 def set_flight_mode():
@@ -293,6 +289,10 @@ def payload_close():
 
     return jsonify({'message': 'Servo closed successfully'}), 200
 
+# Pre-allocated PPS buffer — avoids allocation in the timing-critical path
+_pps_buf = bytearray(ctypes.sizeof(_PPSFData))
+_pps_fdata = _PPSFData.from_buffer(_pps_buf)
+
 def wait_for_pulse(pps_fd: int) -> float:
     """Blocks until the next genuine PPS assert using the kernel PPSAPI.
     PPS_FETCH blocks internally (wait_event_interruptible_timeout) until a
@@ -301,9 +301,8 @@ def wait_for_pulse(pps_fd: int) -> float:
     Returns the kernel hardware timestamp of the pulse.
     """
     global _last_assert_seq
-    print("Waiting for pulse...")
-    buf = bytearray(ctypes.sizeof(_PPSFData))
-    fdata = _PPSFData.from_buffer(buf)
+    fdata = _pps_fdata
+    buf = _pps_buf
 
     # Seed sequence on first call so we only accept NEW events
     if _last_assert_seq is None:
@@ -320,18 +319,34 @@ def wait_for_pulse(pps_fd: int) -> float:
         try:
             fcntl.ioctl(pps_fd, _PPS_FETCH, buf)
         except TimeoutError:
-            print("PPS_FETCH timeout, retrying...")
             continue
         seq = fdata.info.assert_sequence
         if seq != _last_assert_seq:
             _last_assert_seq = seq
-            print("Pulse received")
             return fdata.info.assert_tu.sec + fdata.info.assert_tu.nsec * 1e-9
-        print("PPS_FETCH timeout, retrying...")
 
 
 camera_thread = None
 stop_camera_thread = threading.Event()
+
+# Queue for offloading disk I/O from the timing-critical capture loop
+_save_queue = queue.Queue()
+
+def _image_writer():
+    """Background thread that drains _save_queue and writes images + metadata to disk."""
+    while True:
+        item = _save_queue.get()
+        if item is None:  # poison pill
+            break
+        file_name, frame, metadata = item
+        try:
+            cv2.imwrite(os.path.join(IMAGE_SAVE_DIR, f'{file_name}.jpg'), frame)
+            with open(os.path.join(IMAGE_SAVE_DIR, f'{file_name}.json'), 'w') as f:
+                json.dump(metadata, f)
+        except Exception as e:
+            print(f"WARN: Failed to save {file_name}: {e}")
+        finally:
+            _save_queue.task_done()
 
 @app.route("/toggle_camera", methods=["POST"])
 def toggle_camera():
@@ -359,9 +374,6 @@ def toggle_camera():
     else:
         print("Stopping Camera")
         stop_camera_thread.set()
-        if camera_connection is not None:
-            camera_connection.release()
-            camera_connection = None
 
     return { "message": "Success!"}, 200
 
@@ -372,53 +384,54 @@ def continuously_capture_images():
     if camera_connection is None or not camera_connection.isOpened():
         print("Initializing camera...")
         camera_connection = cv2.VideoCapture(CAMERA_USB_PORT)
+        camera_connection.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         if not camera_connection.isOpened():
             print("ERROR: Could not open camera")
             return
 
+    # Start the background writer thread for disk I/O
+    writer = threading.Thread(target=_image_writer, daemon=True)
+    writer.start()
+
     print("Camera ready, waiting for PPS pulses.")
     pps_fd = _pps_open()
     try:
-        while is_camera_on and not stop_camera_thread.is_set():
+        while not stop_camera_thread.is_set():
             pulse_time = wait_for_pulse(pps_fd)
             if stop_camera_thread.is_set():
                 break
+
+            # Snapshot vehicle state immediately at pulse time (before frame read latency)
+            with vehicle_data_lock:
+                vehicle_data_snapshot = dict(vehicle_data)
+            vehicle_data_snapshot["pps_timestamp"] = pulse_time
+
             image_number += 1
-            take_picture(image_number, camera_connection)
+            take_picture(image_number, camera_connection, vehicle_data_snapshot)
     finally:
         os.close(pps_fd)
+        # Drain the save queue before releasing the camera
+        _save_queue.join()
+        _save_queue.put(None)  # stop the writer thread
+        if camera_connection is not None:
+            camera_connection.release()
+            camera_connection = None
 
-def take_picture(image_number, camera_connection):
-    print(f"Beginning capturing capture{image_number}.jpg")
-
-    # Clear buffer to get the most recent frame
-    for _ in range(5):
-        camera_connection.grab()
-
+def take_picture(image_number, camera_connection, metadata):
     ret, frame = camera_connection.read()
     if not ret:
         print(f"WARN: Failed to capture frame {image_number}")
         return
 
-    vehicle_data_json = json.dumps(vehicle_data)
-    ret, jpeg_buf = cv2.imencode('.jpg', frame)
-    if not ret:
-        print(f"WARN: Failed to encode frame {image_number} as JPEG")
-        return
-
     file_name = f'{image_number:05d}'
 
-    # Save locally
-    os.makedirs(IMAGE_SAVE_DIR, exist_ok=True)
-    cv2.imwrite(os.path.join(IMAGE_SAVE_DIR, f'{file_name}.jpg'), frame)
-    with open(os.path.join(IMAGE_SAVE_DIR, f'{file_name}.json'), 'w') as f:
-        f.write(vehicle_data_json)
-    print(f"Saved {file_name} locally to {IMAGE_SAVE_DIR}")
+    # Enqueue for async disk write — keeps the capture loop tight
+    _save_queue.put((file_name, frame, metadata))
 
 @app.route("/heartbeat-validate")
 def heartbeat_validate():
-    # vehicle_data is being continuously updated by a separate thread
-    return vehicle_data
+    with vehicle_data_lock:
+        return dict(vehicle_data)
 
 def receive_vehicle_position():  # Actively runs and receives live vehicle data on a separate thread
     '''
@@ -438,16 +451,18 @@ def receive_vehicle_position():  # Actively runs and receives live vehicle data 
             continue
 
         if len(items) == len(vehicle_data):
-            vehicle_data["last_time"] = message_time
-
-            for i, key in enumerate(list(vehicle_data.keys())[1:], start=1):
-                vehicle_data[key] = float(items[i])
+            with vehicle_data_lock:
+                vehicle_data["last_time"] = message_time
+                for i, key in enumerate(_vehicle_keys, start=1):
+                    vehicle_data[key] = float(items[i])
         else:
             print(f"Received data item does not match expected length...")
 
 if __name__ == "__main__":
     # Need to take a parameter off of the command line to determine if we are a plane or copter 
     # kit = ServoKit(channels=16)
+
+    os.makedirs(IMAGE_SAVE_DIR, exist_ok=True)
 
     position_thread = threading.Thread(target=receive_vehicle_position, daemon=True)
     position_thread.start()
