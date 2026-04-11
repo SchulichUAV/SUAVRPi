@@ -1,35 +1,70 @@
 # Buit to sync with GCS2025 in Schulich UAV repository/organization
 # Built for Raspberry Pi 5 (Linux OS)
 
-from picamera2 import Picamera2, Preview
 from flask import Flask, jsonify, request, Response
 from flask_cors import CORS
 from math import ceil
 from adafruit_servokit import ServoKit
+import cv2
 import requests
 import threading
 import socket
+import ctypes
+import fcntl
 import json
 import sys
 import time
+import os
 from io import BytesIO
 from os import path
 import argparse
 import threading
-import RPi.GPIO as GPIO
 
-import modules.AutopilotDevelopment.General.Operations.initialize as initialize
-import modules.AutopilotDevelopment.General.Operations.mode as autopilot_mode
-import modules.AutopilotDevelopment.General.Operations.mission as mission
-import modules.AutopilotDevelopment.Plane.Operations.altitude as autopilot_altitude
-import modules.payload as payload
+# import modules.AutopilotDevelopment.General.Operations.initialize as initialize
+# import modules.AutopilotDevelopment.General.Operations.mode as autopilot_mode
+# import modules.AutopilotDevelopment.General.Operations.mission as mission
+# import modules.AutopilotDevelopment.Plane.Operations.altitude as autopilot_altitude
+# import modules.payload as payload
 
 
 GCS_URL = "http://192.168.1.64:80"
 VEHICLE_PORT = "udp:127.0.0.1:5006"
-DELAY = 0.25
+PPS_DEVICE = "/dev/pps0"  # kernel PPS driver via dtoverlay=pps-gpio,gpiopin=4
+CAMERA_USB_PORT = 0
 
-picam2 = None
+# ── Kernel PPSAPI (linux/pps.h) ──────────────────────────────────────────────
+class _PPSKTime(ctypes.Structure):
+    _fields_ = [("sec", ctypes.c_int64), ("nsec", ctypes.c_int32), ("flags", ctypes.c_uint32)]
+
+class _PPSKInfo(ctypes.Structure):
+    _fields_ = [
+        ("assert_sequence", ctypes.c_uint32),
+        ("clear_sequence",  ctypes.c_uint32),
+        ("assert_tu",       _PPSKTime),
+        ("clear_tu",        _PPSKTime),
+        ("current_mode",    ctypes.c_int),
+    ]
+
+class _PPSFData(ctypes.Structure):
+    _fields_ = [("info", _PPSKInfo), ("timeout", _PPSKTime)]
+
+def _ioctl_nr(direction, nr, size):
+    return (direction << 30) | (ord('p') << 8) | nr | (size << 16)
+
+# PPS ioctls use pointer types in the UAPI header, so the encoded size is
+# sizeof(pointer) = 8 on 64-bit, not sizeof(struct pps_fdata).
+_PPS_FETCH       = _ioctl_nr(3, 0xa4, ctypes.sizeof(ctypes.c_void_p))   # _IOWR
+_last_assert_seq = None
+
+def _pps_open() -> int:
+    """Open PPS_DEVICE. dtoverlay=pps-gpio already enables assert capture."""
+    global _last_assert_seq
+    _last_assert_seq = None
+    return os.open(PPS_DEVICE, os.O_RDWR)
+# ─────────────────────────────────────────────────────────────────────────────
+IMAGE_SAVE_DIR = "/home/suavgeopi/images"
+
+camera_connection = None
 vehicle_connection = None
 is_camera_on = False
 image_number = 0
@@ -72,11 +107,11 @@ def set_flight_mode():
         json_data = request.json
         mode_id = int(json_data['mode_id'])
         # TODO: Need to determine if we are plane or copter mode when starting the server
-        selected_flight_mode = list(autopilot_mode.plane_modes.keys())[mode_id] # list of keys in dictionary, access the key with mode id as index
-        print(f'We are in: {selected_flight_mode}')
+        # selected_flight_mode = list(autopilot_mode.plane_modes.keys())[mode_id]
+        # print(f'We are in: {selected_flight_mode}')
 
         # Retrieve mode_id mapping and print the mode name (mode mappings stored in AutopilotDevelopment/General/Operations/mode.py)
-        print(autopilot_mode.set_mode(vehicle_connection, mode_id)) # TODO: Need to use set_mode from plane.py or copter.py depending on current vehicle
+        # print(autopilot_mode.set_mode(vehicle_connection, mode_id)) # TODO: Need to use set_mode from plane.py or copter.py depending on current vehicle
     except Exception as e:
         return jsonify({'error': "Invalid operation."}), 400
 
@@ -88,7 +123,7 @@ def set_altitude_goto():
         json_data = request.json
         altitude = int(json_data['altitude'])
         if altitude >= 0:
-            autopilot_altitude.set_current_altitude(vehicle_connection, altitude)
+            # autopilot_altitude.set_current_altitude(vehicle_connection, altitude)
             print(f'Setting altitude to: {altitude}')
         else:
             print("Error: setting altitude to less than 0")
@@ -108,7 +143,7 @@ def payload_drop_mission():
 
         payload_object_coord = [target_lat, target_lon, drop_altitude]
 
-        mission.upload_payload_drop_mission(vehicle_connection, payload_object_coord)
+        # mission.upload_payload_drop_mission(vehicle_connection, payload_object_coord)
         print("Mission successfully uploaded.")
         return jsonify({'message': 'Mission uploaded successfully.'}), 200
             
@@ -129,11 +164,11 @@ def monitor_mission_and_drop():
                 while True:
                     msg = vehicle_connection.recv_match(type='MISSION_CURRENT', blocking=True, timeout=5)
                     if msg is not None and msg.seq == 2:  # Assuming seq 2 is the payload drop waypoint
-                        autopilot_mode.set_mode(vehicle_connection, 10)  # Set to AUTO mode
+                        # autopilot_mode.set_mode(vehicle_connection, 10)  # Set to AUTO mode
                         break
 
                 # Drop the payload
-                mission.check_distance_and_drop(vehicle_connection, bay - 1, kit, vehicle_data)
+                # mission.check_distance_and_drop(vehicle_connection, bay - 1, kit, vehicle_data)
                 print(f"Payload drop completed for bay {bay}")
             except Exception as drop_error:
                 print(f"[Background Thread] Error in mission drop: {drop_error}")
@@ -160,7 +195,8 @@ def payload_manual_control():
 
     if 1 <= payload_id <= 4:
         try:
-            payload.set_servo_state(payload_id - 1, payload_open)
+            # payload.set_servo_state(payload_id - 1, payload_open)
+            pass
         except Exception as e:
             print("Could not set servo state:", e)
             return jsonify({'error': "Failed to set servo state."}), 400
@@ -180,7 +216,8 @@ def payload_release():
         return jsonify({'error': 'Invalid bay (must be an integer from 1 to 4).'}), 400
 
     try:
-        payload.payload_release(kit, payload_id - 1, vehicle_data)
+        # payload.payload_release(kit, payload_id - 1, vehicle_data)
+        pass
     except Exception as e:
         print("Could not release payload:", e)
         return jsonify({'error': "Failed to release payload."}), 400
@@ -190,7 +227,8 @@ def payload_release():
 @app.route('/payload_release_all', methods=["POST"])
 def payload_release_all():
     try:
-        payload.release_all(kit, vehicle_data)
+        # payload.release_all(kit, vehicle_data)
+        pass
     except Exception as e:
         print("Could not release all payloads:", e)
         return jsonify({'error': "Failed to release all payloads."}), 400
@@ -200,7 +238,8 @@ def payload_release_all():
 @app.route('/payload_close_all', methods=["POST"])
 def payload_close_all():
     try:
-        payload.close_all_servos(kit)
+        # payload.close_all_servos(kit)
+        pass
     except Exception as e:
         print("Could not close all servos:", e)
         return jsonify({'error': "Failed to close all servos."}), 400
@@ -210,7 +249,8 @@ def payload_close_all():
 @app.route('/payload_open_all', methods=["POST"])
 def payload_open_all():
     try:
-        payload.open_all_servos(kit)
+        # payload.open_all_servos(kit)
+        pass
     except Exception as e:
         print("Could not open all servos:", e)
         return jsonify({'error': "Failed to open all servos."}), 400
@@ -227,7 +267,8 @@ def payload_open():
         return jsonify({'error': 'Invalid bay (must be an integer from 1 to 4).'}), 400
 
     try:
-        payload.open_servo(kit, payload_id - 1)
+        # payload.open_servo(kit, payload_id - 1)
+        pass
     except Exception as e:
         print("Could not open servo:", e)
         return jsonify({'error': "Failed to open servo."}), 400
@@ -244,12 +285,50 @@ def payload_close():
         return jsonify({'error': 'Invalid bay (must be an integer from 1 to 4).'}), 400
 
     try:
-        payload.close_servo(kit, payload_id - 1)
+        # payload.close_servo(kit, payload_id - 1)
+        pass
     except Exception as e:
         print("Could not close servo:", e)
         return jsonify({'error': "Failed to close servo."}), 400
 
     return jsonify({'message': 'Servo closed successfully'}), 200
+
+def wait_for_pulse(pps_fd: int) -> float:
+    """Blocks until the next genuine PPS assert using the kernel PPSAPI.
+    PPS_FETCH blocks internally (wait_event_interruptible_timeout) until a
+    new hardware pulse increments assert_sequence, so unlike select() it
+    will NOT return on a stale/already-seen event.
+    Returns the kernel hardware timestamp of the pulse.
+    """
+    global _last_assert_seq
+    print("Waiting for pulse...")
+    buf = bytearray(ctypes.sizeof(_PPSFData))
+    fdata = _PPSFData.from_buffer(buf)
+
+    # Seed sequence on first call so we only accept NEW events
+    if _last_assert_seq is None:
+        try:
+            fcntl.ioctl(pps_fd, _PPS_FETCH, buf)
+        except TimeoutError:
+            pass
+        _last_assert_seq = fdata.info.assert_sequence
+
+    while True:
+        fdata.timeout.sec  = 2
+        fdata.timeout.nsec = 0
+        fdata.timeout.flags = 0
+        try:
+            fcntl.ioctl(pps_fd, _PPS_FETCH, buf)
+        except TimeoutError:
+            print("PPS_FETCH timeout, retrying...")
+            continue
+        seq = fdata.info.assert_sequence
+        if seq != _last_assert_seq:
+            _last_assert_seq = seq
+            print("Pulse received")
+            return fdata.info.assert_tu.sec + fdata.info.assert_tu.nsec * 1e-9
+        print("PPS_FETCH timeout, retrying...")
+
 
 camera_thread = None
 stop_camera_thread = threading.Event()
@@ -280,64 +359,61 @@ def toggle_camera():
     else:
         print("Stopping Camera")
         stop_camera_thread.set()
+        if camera_connection is not None:
+            camera_connection.release()
+            camera_connection = None
 
     return { "message": "Success!"}, 200
 
 def continuously_capture_images():
-    global is_camera_on
-    global picam2
+    global camera_connection
     global image_number
 
-    if picam2 is None:
+    if camera_connection is None or not camera_connection.isOpened():
         print("Initializing camera...")
-        picam2 = Picamera2()
-        camera_config = picam2.create_still_configuration()
-        picam2.configure(camera_config)
-        picam2.start_preview(Preview.NULL)
-        time.sleep(1)
-    else:
-        print("picam2 is not none! starting picam.")
-    
-    picam2.start()
+        camera_connection = cv2.VideoCapture(CAMERA_USB_PORT)
+        if not camera_connection.isOpened():
+            print("ERROR: Could not open camera")
+            return
 
+    print("Camera ready, waiting for PPS pulses.")
+    pps_fd = _pps_open()
     try:
         while is_camera_on and not stop_camera_thread.is_set():
+            pulse_time = wait_for_pulse(pps_fd)
+            if stop_camera_thread.is_set():
+                break
             image_number += 1
-            delay_time_remaining = DELAY - take_picture(image_number, picam2)
-            if delay_time_remaining > 0:
-                time.sleep(delay_time_remaining)
-    except Exception as e:
-        print("Error in camera thread:", e)
+            take_picture(image_number, camera_connection)
     finally:
-        print("Stopping camera thread...")
-        picam2.stop()
+        os.close(pps_fd)
 
-def take_picture(image_number, picam2):
+def take_picture(image_number, camera_connection):
     print(f"Beginning capturing capture{image_number}.jpg")
-    start_time = time.time()
 
-    image_stream = BytesIO()
+    # Clear buffer to get the most recent frame
+    for _ in range(5):
+        camera_connection.grab()
+
+    ret, frame = camera_connection.read()
+    if not ret:
+        print(f"WARN: Failed to capture frame {image_number}")
+        return
+
     vehicle_data_json = json.dumps(vehicle_data)
-    image = picam2.capture_image('main')
-    image.save(image_stream, format='JPEG')
-    image_stream.seek(0)
-
-    headers = {} 
+    ret, jpeg_buf = cv2.imencode('.jpg', frame)
+    if not ret:
+        print(f"WARN: Failed to encode frame {image_number} as JPEG")
+        return
 
     file_name = f'{image_number:05d}'
 
-    image_file = {
-        'file': (f'{file_name}.jpg', image_stream, 'image/jpg'),
-    }
-    response = requests.request("POST", f"{GCS_URL}/submit", headers=headers, files=image_file)
-
-    json_stream = BytesIO(vehicle_data_json.encode('utf-8'))
-    json_file = {
-        'file': (f'{file_name}.json', json_stream, 'application/json'),
-    }
-    response = requests.request("POST", f"{GCS_URL}/submit", headers=headers, files=json_file)
-
-    return time.time() - start_time
+    # Save locally
+    os.makedirs(IMAGE_SAVE_DIR, exist_ok=True)
+    cv2.imwrite(os.path.join(IMAGE_SAVE_DIR, f'{file_name}.jpg'), frame)
+    with open(os.path.join(IMAGE_SAVE_DIR, f'{file_name}.json'), 'w') as f:
+        f.write(vehicle_data_json)
+    print(f"Saved {file_name} locally to {IMAGE_SAVE_DIR}")
 
 @app.route("/heartbeat-validate")
 def heartbeat_validate():
@@ -371,20 +447,20 @@ def receive_vehicle_position():  # Actively runs and receives live vehicle data 
 
 if __name__ == "__main__":
     # Need to take a parameter off of the command line to determine if we are a plane or copter 
-    kit = ServoKit(channels=16)
+    # kit = ServoKit(channels=16)
 
     position_thread = threading.Thread(target=receive_vehicle_position, daemon=True)
     position_thread.start()
     time.sleep(1)
 
-    print(f"Attempting to connect to port: {VEHICLE_PORT}")
-    vehicle_connection = initialize.connect_to_vehicle(VEHICLE_PORT)
-    print("Vehicle connection established.")
-    retVal = initialize.verify_connection(vehicle_connection)
-    print("Vehicle connection verified.")
+    # print(f"Attempting to connect to port: {VEHICLE_PORT}")
+    # vehicle_connection = initialize.connect_to_vehicle(VEHICLE_PORT)
+    # print("Vehicle connection established.")
+    # retVal = initialize.verify_connection(vehicle_connection)
+    # print("Vehicle connection verified.")
 
-    if not retVal:
-        print("Error. Could not connect and/or verify a valid connection to the vehicle.")
-        sys.exit(1)
+    # if not retVal:
+    #     print("Error. Could not connect and/or verify a valid connection to the vehicle.")
+    #     sys.exit(1)
 
     app.run(debug=False, host='0.0.0.0', port=5000)
