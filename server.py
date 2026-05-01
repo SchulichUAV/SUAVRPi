@@ -14,11 +14,11 @@ import sys
 import time
 import os
 
-# import modules.AutopilotDevelopment.General.Operations.initialize as initialize
-# import modules.AutopilotDevelopment.General.Operations.mode as autopilot_mode
-# import modules.AutopilotDevelopment.General.Operations.mission as mission
-# import modules.AutopilotDevelopment.Plane.Operations.altitude as autopilot_altitude
-# import modules.payload as payload
+import modules.AutopilotDevelopment.General.Operations.initialize as initialize
+import modules.AutopilotDevelopment.General.Operations.mode as autopilot_mode
+import modules.AutopilotDevelopment.General.Operations.mission as mission
+import modules.AutopilotDevelopment.Plane.Operations.altitude as autopilot_altitude
+import modules.payload as payload
 
 
 GCS_URL = "http://192.168.1.64:80"
@@ -103,11 +103,11 @@ def set_flight_mode():
         json_data = request.json
         mode_id = int(json_data['mode_id'])
         # TODO: Need to determine if we are plane or copter mode when starting the server
-        # selected_flight_mode = list(autopilot_mode.plane_modes.keys())[mode_id]
-        # print(f'We are in: {selected_flight_mode}')
+        selected_flight_mode = list(autopilot_mode.plane_modes.keys())[mode_id] # list of keys in dictionary, access the key with mode id as index
+        print(f'We are in: {selected_flight_mode}')
 
         # Retrieve mode_id mapping and print the mode name (mode mappings stored in AutopilotDevelopment/General/Operations/mode.py)
-        # print(autopilot_mode.set_mode(vehicle_connection, mode_id)) # TODO: Need to use set_mode from plane.py or copter.py depending on current vehicle
+        print(autopilot_mode.set_mode(vehicle_connection, mode_id)) # TODO: Need to use set_mode from plane.py or copter.py depending on current vehicle
     except Exception as e:
         return jsonify({'error': "Invalid operation."}), 400
 
@@ -119,7 +119,7 @@ def set_altitude_goto():
         json_data = request.json
         altitude = int(json_data['altitude'])
         if altitude >= 0:
-            # autopilot_altitude.set_current_altitude(vehicle_connection, altitude)
+            autopilot_altitude.set_current_altitude(vehicle_connection, altitude)
             print(f'Setting altitude to: {altitude}')
         else:
             print("Error: setting altitude to less than 0")
@@ -139,7 +139,7 @@ def payload_drop_mission():
 
         payload_object_coord = [target_lat, target_lon, drop_altitude]
 
-        # mission.upload_payload_drop_mission(vehicle_connection, payload_object_coord)
+        mission.upload_payload_drop_mission(vehicle_connection, payload_object_coord)
         print("Mission successfully uploaded.")
         return jsonify({'message': 'Mission uploaded successfully.'}), 200
             
@@ -160,11 +160,11 @@ def monitor_mission_and_drop():
                 while True:
                     msg = vehicle_connection.recv_match(type='MISSION_CURRENT', blocking=True, timeout=5)
                     if msg is not None and msg.seq == 2:  # Assuming seq 2 is the payload drop waypoint
-                        # autopilot_mode.set_mode(vehicle_connection, 10)  # Set to AUTO mode
+                        autopilot_mode.set_mode(vehicle_connection, 10)  # Set to AUTO mode
                         break
 
                 # Drop the payload
-                # mission.check_distance_and_drop(vehicle_connection, bay - 1, kit, vehicle_data)
+                mission.check_distance_and_drop(vehicle_connection, bay - 1, kit, vehicle_data)
                 print(f"Payload drop completed for bay {bay}")
             except Exception as drop_error:
                 print(f"[Background Thread] Error in mission drop: {drop_error}")
@@ -191,8 +191,7 @@ def payload_manual_control():
 
     if 1 <= payload_id <= 4:
         try:
-            # payload.set_servo_state(payload_id - 1, payload_open)
-            pass
+            payload.set_servo_state(payload_id - 1, payload_open)
         except Exception as e:
             print("Could not set servo state:", e)
             return jsonify({'error': "Failed to set servo state."}), 400
@@ -212,8 +211,7 @@ def payload_release():
         return jsonify({'error': 'Invalid bay (must be an integer from 1 to 4).'}), 400
 
     try:
-        # payload.payload_release(kit, payload_id - 1, vehicle_data)
-        pass
+        payload.payload_release(kit, payload_id - 1, vehicle_data)
     except Exception as e:
         print("Could not release payload:", e)
         return jsonify({'error': "Failed to release payload."}), 400
@@ -223,8 +221,7 @@ def payload_release():
 @app.route('/payload_release_all', methods=["POST"])
 def payload_release_all():
     try:
-        # payload.release_all(kit, vehicle_data)
-        pass
+        payload.release_all(kit, vehicle_data)
     except Exception as e:
         print("Could not release all payloads:", e)
         return jsonify({'error': "Failed to release all payloads."}), 400
@@ -234,8 +231,7 @@ def payload_release_all():
 @app.route('/payload_close_all', methods=["POST"])
 def payload_close_all():
     try:
-        # payload.close_all_servos(kit)
-        pass
+        payload.close_all_servos(kit)
     except Exception as e:
         print("Could not close all servos:", e)
         return jsonify({'error': "Failed to close all servos."}), 400
@@ -245,8 +241,7 @@ def payload_close_all():
 @app.route('/payload_open_all', methods=["POST"])
 def payload_open_all():
     try:
-        # payload.open_all_servos(kit)
-        pass
+        payload.open_all_servos(kit)
     except Exception as e:
         print("Could not open all servos:", e)
         return jsonify({'error': "Failed to open all servos."}), 400
@@ -263,8 +258,7 @@ def payload_open():
         return jsonify({'error': 'Invalid bay (must be an integer from 1 to 4).'}), 400
 
     try:
-        # payload.open_servo(kit, payload_id - 1)
-        pass
+        payload.open_servo(kit, payload_id - 1)
     except Exception as e:
         print("Could not open servo:", e)
         return jsonify({'error': "Failed to open servo."}), 400
@@ -281,8 +275,7 @@ def payload_close():
         return jsonify({'error': 'Invalid bay (must be an integer from 1 to 4).'}), 400
 
     try:
-        # payload.close_servo(kit, payload_id - 1)
-        pass
+        payload.close_servo(kit, payload_id - 1)
     except Exception as e:
         print("Could not close servo:", e)
         return jsonify({'error': "Failed to close servo."}), 400
@@ -460,7 +453,7 @@ def receive_vehicle_position():  # Actively runs and receives live vehicle data 
 
 if __name__ == "__main__":
     # Need to take a parameter off of the command line to determine if we are a plane or copter 
-    # kit = ServoKit(channels=16)
+    kit = ServoKit(channels=16)
 
     os.makedirs(IMAGE_SAVE_DIR, exist_ok=True)
 
@@ -468,14 +461,14 @@ if __name__ == "__main__":
     position_thread.start()
     time.sleep(1)
 
-    # print(f"Attempting to connect to port: {VEHICLE_PORT}")
-    # vehicle_connection = initialize.connect_to_vehicle(VEHICLE_PORT)
-    # print("Vehicle connection established.")
-    # retVal = initialize.verify_connection(vehicle_connection)
-    # print("Vehicle connection verified.")
+    print(f"Attempting to connect to port: {VEHICLE_PORT}")
+    vehicle_connection = initialize.connect_to_vehicle(VEHICLE_PORT)
+    print("Vehicle connection established.")
+    retVal = initialize.verify_connection(vehicle_connection)
+    print("Vehicle connection verified.")
 
-    # if not retVal:
-    #     print("Error. Could not connect and/or verify a valid connection to the vehicle.")
-    #     sys.exit(1)
+    if not retVal:
+        print("Error. Could not connect and/or verify a valid connection to the vehicle.")
+        sys.exit(1)
 
     app.run(debug=False, host='0.0.0.0', port=5000)
