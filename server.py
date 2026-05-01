@@ -3,6 +3,7 @@
 
 from flask import Flask, jsonify, request
 from flask_cors import CORS
+from adafruit_servokit import ServoKit
 import cv2
 import threading
 import queue
