@@ -1,22 +1,19 @@
 # Buit to sync with GCS2025 in Schulich UAV repository/organization
 # Built for Raspberry Pi 5 (Linux OS)
 
-from picamera2 import Picamera2, Preview
-from flask import Flask, jsonify, request, Response
+from flask import Flask, jsonify, request
 from flask_cors import CORS
-from math import ceil
 from adafruit_servokit import ServoKit
-import requests
+import cv2
 import threading
+import queue
 import socket
+import ctypes
+import fcntl
 import json
 import sys
 import time
-from io import BytesIO
-from os import path
-import argparse
-import threading
-import RPi.GPIO as GPIO
+import os
 
 import modules.AutopilotDevelopment.General.Operations.initialize as initialize
 import modules.AutopilotDevelopment.General.Operations.mode as autopilot_mode
@@ -27,9 +24,42 @@ import modules.payload as payload
 
 GCS_URL = "http://192.168.1.64:80"
 VEHICLE_PORT = "udp:127.0.0.1:5006"
-DELAY = 0.25
+PPS_DEVICE = "/dev/pps0"  # kernel PPS driver via dtoverlay=pps-gpio,gpiopin=4
+CAMERA_USB_PORT = 0
 
-picam2 = None
+# ── Kernel PPSAPI (linux/pps.h) ──────────────────────────────────────────────
+class _PPSKTime(ctypes.Structure):
+    _fields_ = [("sec", ctypes.c_int64), ("nsec", ctypes.c_int32), ("flags", ctypes.c_uint32)]
+
+class _PPSKInfo(ctypes.Structure):
+    _fields_ = [
+        ("assert_sequence", ctypes.c_uint32),
+        ("clear_sequence",  ctypes.c_uint32),
+        ("assert_tu",       _PPSKTime),
+        ("clear_tu",        _PPSKTime),
+        ("current_mode",    ctypes.c_int),
+    ]
+
+class _PPSFData(ctypes.Structure):
+    _fields_ = [("info", _PPSKInfo), ("timeout", _PPSKTime)]
+
+def _ioctl_nr(direction, nr, size):
+    return (direction << 30) | (ord('p') << 8) | nr | (size << 16)
+
+# PPS ioctls use pointer types in the UAPI header, so the encoded size is
+# sizeof(pointer) = 8 on 64-bit, not sizeof(struct pps_fdata).
+_PPS_FETCH       = _ioctl_nr(3, 0xa4, ctypes.sizeof(ctypes.c_void_p))   # _IOWR
+_last_assert_seq = None
+
+def _pps_open() -> int:
+    """Open PPS_DEVICE. dtoverlay=pps-gpio already enables assert capture."""
+    global _last_assert_seq
+    _last_assert_seq = None
+    return os.open(PPS_DEVICE, os.O_RDWR)
+# ─────────────────────────────────────────────────────────────────────────────
+IMAGE_SAVE_DIR = "/home/suavgeopi/images"
+
+camera_connection = None
 vehicle_connection = None
 is_camera_on = False
 image_number = 0
@@ -64,6 +94,8 @@ vehicle_data = {
     "battery_current": 0,
     "battery_remaining": 0,
 }
+vehicle_data_lock = threading.Lock()
+_vehicle_keys = list(vehicle_data.keys())[1:]
 
 @app.route('/set_flight_mode', methods=["POST"])
 def set_flight_mode():
@@ -251,8 +283,64 @@ def payload_close():
 
     return jsonify({'message': 'Servo closed successfully'}), 200
 
+# Pre-allocated PPS buffer — avoids allocation in the timing-critical path
+_pps_buf = bytearray(ctypes.sizeof(_PPSFData))
+_pps_fdata = _PPSFData.from_buffer(_pps_buf)
+
+def wait_for_pulse(pps_fd: int) -> float:
+    """Blocks until the next genuine PPS assert using the kernel PPSAPI.
+    PPS_FETCH blocks internally (wait_event_interruptible_timeout) until a
+    new hardware pulse increments assert_sequence, so unlike select() it
+    will NOT return on a stale/already-seen event.
+    Returns the kernel hardware timestamp of the pulse.
+    """
+    global _last_assert_seq
+    fdata = _pps_fdata
+    buf = _pps_buf
+
+    # Seed sequence on first call so we only accept NEW events
+    if _last_assert_seq is None:
+        try:
+            fcntl.ioctl(pps_fd, _PPS_FETCH, buf)
+        except TimeoutError:
+            pass
+        _last_assert_seq = fdata.info.assert_sequence
+
+    while True:
+        fdata.timeout.sec  = 2
+        fdata.timeout.nsec = 0
+        fdata.timeout.flags = 0
+        try:
+            fcntl.ioctl(pps_fd, _PPS_FETCH, buf)
+        except TimeoutError:
+            continue
+        seq = fdata.info.assert_sequence
+        if seq != _last_assert_seq:
+            _last_assert_seq = seq
+            return fdata.info.assert_tu.sec + fdata.info.assert_tu.nsec * 1e-9
+
+
 camera_thread = None
 stop_camera_thread = threading.Event()
+
+# Queue for offloading disk I/O from the timing-critical capture loop
+_save_queue = queue.Queue()
+
+def _image_writer():
+    """Background thread that drains _save_queue and writes images + metadata to disk."""
+    while True:
+        item = _save_queue.get()
+        if item is None:  # poison pill
+            break
+        file_name, frame, metadata = item
+        try:
+            cv2.imwrite(os.path.join(IMAGE_SAVE_DIR, f'{file_name}.jpg'), frame)
+            with open(os.path.join(IMAGE_SAVE_DIR, f'{file_name}.json'), 'w') as f:
+                json.dump(metadata, f)
+        except Exception as e:
+            print(f"WARN: Failed to save {file_name}: {e}")
+        finally:
+            _save_queue.task_done()
 
 @app.route("/toggle_camera", methods=["POST"])
 def toggle_camera():
@@ -284,65 +372,60 @@ def toggle_camera():
     return { "message": "Success!"}, 200
 
 def continuously_capture_images():
-    global is_camera_on
-    global picam2
+    global camera_connection
     global image_number
 
-    if picam2 is None:
+    if camera_connection is None or not camera_connection.isOpened():
         print("Initializing camera...")
-        picam2 = Picamera2()
-        camera_config = picam2.create_still_configuration()
-        picam2.configure(camera_config)
-        picam2.start_preview(Preview.NULL)
-        time.sleep(1)
-    else:
-        print("picam2 is not none! starting picam.")
-    
-    picam2.start()
+        camera_connection = cv2.VideoCapture(CAMERA_USB_PORT)
+        camera_connection.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        if not camera_connection.isOpened():
+            print("ERROR: Could not open camera")
+            return
 
+    # Start the background writer thread for disk I/O
+    writer = threading.Thread(target=_image_writer, daemon=True)
+    writer.start()
+
+    print("Camera ready, waiting for PPS pulses.")
+    pps_fd = _pps_open()
     try:
-        while is_camera_on and not stop_camera_thread.is_set():
+        while not stop_camera_thread.is_set():
+            pulse_time = wait_for_pulse(pps_fd)
+            if stop_camera_thread.is_set():
+                break
+
+            # Snapshot vehicle state immediately at pulse time (before frame read latency)
+            with vehicle_data_lock:
+                vehicle_data_snapshot = dict(vehicle_data)
+            vehicle_data_snapshot["pps_timestamp"] = pulse_time
+
             image_number += 1
-            delay_time_remaining = DELAY - take_picture(image_number, picam2)
-            if delay_time_remaining > 0:
-                time.sleep(delay_time_remaining)
-    except Exception as e:
-        print("Error in camera thread:", e)
+            take_picture(image_number, camera_connection, vehicle_data_snapshot)
     finally:
-        print("Stopping camera thread...")
-        picam2.stop()
+        os.close(pps_fd)
+        # Drain the save queue before releasing the camera
+        _save_queue.join()
+        _save_queue.put(None)  # stop the writer thread
+        if camera_connection is not None:
+            camera_connection.release()
+            camera_connection = None
 
-def take_picture(image_number, picam2):
-    print(f"Beginning capturing capture{image_number}.jpg")
-    start_time = time.time()
-
-    image_stream = BytesIO()
-    vehicle_data_json = json.dumps(vehicle_data)
-    image = picam2.capture_image('main')
-    image.save(image_stream, format='JPEG')
-    image_stream.seek(0)
-
-    headers = {} 
+def take_picture(image_number, camera_connection, metadata):
+    ret, frame = camera_connection.read()
+    if not ret:
+        print(f"WARN: Failed to capture frame {image_number}")
+        return
 
     file_name = f'{image_number:05d}'
 
-    image_file = {
-        'file': (f'{file_name}.jpg', image_stream, 'image/jpg'),
-    }
-    response = requests.request("POST", f"{GCS_URL}/submit", headers=headers, files=image_file)
-
-    json_stream = BytesIO(vehicle_data_json.encode('utf-8'))
-    json_file = {
-        'file': (f'{file_name}.json', json_stream, 'application/json'),
-    }
-    response = requests.request("POST", f"{GCS_URL}/submit", headers=headers, files=json_file)
-
-    return time.time() - start_time
+    # Enqueue for async disk write — keeps the capture loop tight
+    _save_queue.put((file_name, frame, metadata))
 
 @app.route("/heartbeat-validate")
 def heartbeat_validate():
-    # vehicle_data is being continuously updated by a separate thread
-    return vehicle_data
+    with vehicle_data_lock:
+        return dict(vehicle_data)
 
 def receive_vehicle_position():  # Actively runs and receives live vehicle data on a separate thread
     '''
@@ -362,16 +445,18 @@ def receive_vehicle_position():  # Actively runs and receives live vehicle data 
             continue
 
         if len(items) == len(vehicle_data):
-            vehicle_data["last_time"] = message_time
-
-            for i, key in enumerate(list(vehicle_data.keys())[1:], start=1):
-                vehicle_data[key] = float(items[i])
+            with vehicle_data_lock:
+                vehicle_data["last_time"] = message_time
+                for i, key in enumerate(_vehicle_keys, start=1):
+                    vehicle_data[key] = float(items[i])
         else:
             print(f"Received data item does not match expected length...")
 
 if __name__ == "__main__":
     # Need to take a parameter off of the command line to determine if we are a plane or copter 
     kit = ServoKit(channels=16)
+
+    os.makedirs(IMAGE_SAVE_DIR, exist_ok=True)
 
     position_thread = threading.Thread(target=receive_vehicle_position, daemon=True)
     position_thread.start()
