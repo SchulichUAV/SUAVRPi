@@ -361,6 +361,13 @@ def wait_for_pulse(pps_fd: int) -> float:
     buf = _pps_buf
 
     while True:
+        # Honor a shutdown request even when PPS is silent. Without this
+        # check the thread can be wedged in PPS_FETCH forever (kernel
+        # ioctl re-entered every 2 s) and a second toggle ON would race a
+        # zombie thread on the shared PPS / camera globals.
+        if stop_camera_thread.is_set():
+            return 0.0
+
         fdata.timeout.sec  = 2
         fdata.timeout.nsec = 0
         fdata.timeout.flags = 0
@@ -463,9 +470,18 @@ def toggle_camera():
         is_camera_on = requested_state
         if requested_state:
             # Wait for any prior thread to finish before starting a new one.
+            # If it refuses to exit, refuse to start a new one rather than
+            # leaving two threads racing on the shared camera + PPS globals.
             if camera_thread is not None and camera_thread.is_alive():
                 stop_camera_thread.set()
                 camera_thread.join(timeout=5)
+                if camera_thread.is_alive():
+                    print("ERROR: previous camera thread did not exit; refusing to start a new one")
+                    is_camera_on = False
+                    return jsonify({
+                        "error": "Previous camera thread is still running. "
+                                 "Check PPS signal / camera USB and try again.",
+                    }), 503
             stop_camera_thread.clear()
             _ensure_writer_thread()
             camera_thread = threading.Thread(
@@ -506,7 +522,6 @@ def continuously_capture_images():
             pulse_time = wait_for_pulse(pps_fd)
             if stop_camera_thread.is_set():
                 break
-
             # Snapshot vehicle state immediately at pulse time (before frame read latency)
             with vehicle_data_lock:
                 vehicle_data_snapshot = dict(vehicle_data)
