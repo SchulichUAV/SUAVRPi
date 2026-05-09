@@ -513,6 +513,7 @@ def continuously_capture_images():
             vehicle_data_snapshot["pps_timestamp"] = pulse_time
 
             image_number += 1
+            print(f"DEBUG: PPS pulse #{image_number} at t={pulse_time:.6f}")
             take_picture(image_number, camera_connection, vehicle_data_snapshot)
     finally:
         os.close(pps_fd)
@@ -530,6 +531,7 @@ def take_picture(image_number, camera_connection, metadata):
         return
 
     file_name = f'{image_number:05d}'
+    print(f"DEBUG: Image {file_name} captured ({frame.shape[1]}x{frame.shape[0]}), queuing write")
 
     # Enqueue for async disk write — keeps the capture loop tight
     _save_queue.put((file_name, frame, metadata))
