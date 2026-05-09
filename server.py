@@ -49,13 +49,66 @@ def _ioctl_nr(direction, nr, size):
 # PPS ioctls use pointer types in the UAPI header, so the encoded size is
 # sizeof(pointer) = 8 on 64-bit, not sizeof(struct pps_fdata).
 _PPS_FETCH       = _ioctl_nr(3, 0xa4, ctypes.sizeof(ctypes.c_void_p))   # _IOWR
+_PPS_GETPARAMS   = _ioctl_nr(2, 0xa1, ctypes.sizeof(ctypes.c_void_p))   # _IOR
+_PPS_SETPARAMS   = _ioctl_nr(1, 0xa2, ctypes.sizeof(ctypes.c_void_p))   # _IOW
+
+# PPS mode flags (from linux/pps.h)
+_PPS_CAPTUREASSERT = 0x01
+_PPS_OFFSETASSERT  = 0x10
+_PPS_TSFMT_TSPEC   = 0x1000
+
+# Configured PPS rate (Hz). Used as a debounce floor against spurious extra
+# wake-ups (e.g. line glitches, double-edge captures).
+PPS_HZ = 10
+_PPS_MIN_INTERVAL_S = 0.5 / PPS_HZ  # accept pulses no more than 2x rate
+
 _last_assert_seq = None
+_last_pulse_time = 0.0
+
+
+class _PPSKParams(ctypes.Structure):
+    _fields_ = [
+        ("api_version", ctypes.c_int),
+        ("mode",        ctypes.c_int),
+        ("assert_off_tu", _PPSKTime),
+        ("clear_off_tu",  _PPSKTime),
+    ]
+
+
+def _pps_configure_assert_only(pps_fd: int) -> None:
+    """Force the PPS source into assert-only capture mode.
+
+    The pps-gpio driver advertises PPS_CAPTUREBOTH by default; on a noisy
+    GPIO line that can produce extra wake-ups beyond the configured pulse
+    rate. We explicitly clear the clear-edge capture so only rising-edge
+    events advance assert_sequence and wake PPS_FETCH waiters.
+    """
+    params = _PPSKParams()
+    try:
+        fcntl.ioctl(pps_fd, _PPS_GETPARAMS, params)
+    except OSError as e:
+        print(f"WARN: PPS_GETPARAMS failed ({e}); using defaults")
+        params.api_version = 1
+        params.mode = 0
+    # Keep only assert capture + offset/format flags. Drop any clear/both bits.
+    params.mode = (params.mode & _PPS_TSFMT_TSPEC) | _PPS_CAPTUREASSERT | _PPS_OFFSETASSERT | _PPS_TSFMT_TSPEC
+    try:
+        fcntl.ioctl(pps_fd, _PPS_SETPARAMS, params)
+    except OSError as e:
+        print(f"WARN: PPS_SETPARAMS failed ({e}); continuing with current mode")
+
 
 def _pps_open() -> int:
-    """Open PPS_DEVICE. dtoverlay=pps-gpio already enables assert capture."""
-    global _last_assert_seq
+    """Open PPS_DEVICE and force assert-only capture."""
+    global _last_assert_seq, _last_pulse_time
     _last_assert_seq = None
-    return os.open(PPS_DEVICE, os.O_RDWR)
+    _last_pulse_time = 0.0
+    # Zero the shared ioctl buffer so a stale assert_sequence from a previous
+    # session can never seed _last_assert_seq.
+    ctypes.memset(ctypes.addressof(_pps_fdata), 0, ctypes.sizeof(_pps_fdata))
+    fd = os.open(PPS_DEVICE, os.O_RDWR)
+    _pps_configure_assert_only(fd)
+    return fd
 # ─────────────────────────────────────────────────────────────────────────────
 IMAGE_SAVE_DIR = "/home/suavgeopi/images"
 
@@ -119,23 +172,22 @@ def set_altitude_goto():
     try:
         json_data = request.json
         altitude = int(json_data['altitude'])
-        if altitude >= 0:
-            autopilot_altitude.set_current_altitude(vehicle_connection, altitude)
-            print(f'Setting altitude to: {altitude}')
-        else:
+        if altitude < 0:
             print("Error: setting altitude to less than 0")
-            
+            return jsonify({'error': "Altitude must be non-negative."}), 400
+        autopilot_altitude.set_current_altitude(vehicle_connection, altitude)
+        print(f'Setting altitude to: {altitude}')
     except Exception as e:
         return jsonify({'error': "Invalid operation."}), 400
 
-    return jsonify({'message': 'Mode set successfully'}), 200
+    return jsonify({'message': 'Altitude set successfully'}), 200
 
 @app.route('/payload_drop_mission', methods=["POST"])
 def payload_drop_mission():
     try:
         json_data = request.json
-        target_lat = json_data['latitude']
-        target_lon = json_data['longitude']
+        target_lat = float(json_data['latitude'])
+        target_lon = float(json_data['longitude'])
         drop_altitude = 20 # 18m = 59ft - lowest allowed altitude is 50ft but want to be low for drops
 
         payload_object_coord = [target_lat, target_lon, drop_altitude]
@@ -289,22 +341,24 @@ _pps_fdata = _PPSFData.from_buffer(_pps_buf)
 
 def wait_for_pulse(pps_fd: int) -> float:
     """Blocks until the next genuine PPS assert using the kernel PPSAPI.
+
     PPS_FETCH blocks internally (wait_event_interruptible_timeout) until a
     new hardware pulse increments assert_sequence, so unlike select() it
-    will NOT return on a stale/already-seen event.
-    Returns the kernel hardware timestamp of the pulse.
+    will NOT return on a stale/already-seen event. We additionally:
+      * Seed _last_assert_seq from a real pulse (not stale buffer bytes),
+        skipping any pulses that occurred while the camera was off.
+      * Reject wake-ups whose hardware timestamp is closer than
+        _PPS_MIN_INTERVAL_S to the previous accepted pulse — defends
+        against double-edge captures and GPIO glitches that would
+        otherwise produce a higher capture rate than the configured
+        PPS frequency.
+      * Warn if the kernel sequence skips, indicating dropped pulses.
+
+    Returns the kernel hardware timestamp of the pulse (seconds, float).
     """
-    global _last_assert_seq
+    global _last_assert_seq, _last_pulse_time
     fdata = _pps_fdata
     buf = _pps_buf
-
-    # Seed sequence on first call so we only accept NEW events
-    if _last_assert_seq is None:
-        try:
-            fcntl.ioctl(pps_fd, _PPS_FETCH, buf)
-        except TimeoutError:
-            pass
-        _last_assert_seq = fdata.info.assert_sequence
 
     while True:
         fdata.timeout.sec  = 2
@@ -313,63 +367,117 @@ def wait_for_pulse(pps_fd: int) -> float:
         try:
             fcntl.ioctl(pps_fd, _PPS_FETCH, buf)
         except TimeoutError:
+            # No pulse in the last 2 s — likely lost the GPS signal. Loop.
             continue
+        except OSError as e:
+            print(f"WARN: PPS_FETCH failed: {e}")
+            time.sleep(0.05)
+            continue
+
         seq = fdata.info.assert_sequence
-        if seq != _last_assert_seq:
+        pulse_time = fdata.info.assert_tu.sec + fdata.info.assert_tu.nsec * 1e-9
+
+        # Seed on first real event so we only accept NEW pulses going forward.
+        if _last_assert_seq is None:
             _last_assert_seq = seq
-            return fdata.info.assert_tu.sec + fdata.info.assert_tu.nsec * 1e-9
+            _last_pulse_time = pulse_time
+            return pulse_time
+
+        # No new event since last fetch — keep waiting.
+        if seq == _last_assert_seq:
+            continue
+
+        # Debounce: ignore pulses arriving suspiciously close to the previous one.
+        delta = pulse_time - _last_pulse_time
+        if delta > 0 and delta < _PPS_MIN_INTERVAL_S:
+            print(f"WARN: spurious PPS event (delta={delta*1000:.2f} ms, "
+                  f"seq {_last_assert_seq}->{seq}); ignoring")
+            _last_assert_seq = seq
+            continue
+
+        # Detect skipped pulses (lost events between fetches).
+        skipped = (seq - _last_assert_seq) & 0xFFFFFFFF
+        if skipped > 1:
+            print(f"WARN: PPS sequence skipped {skipped - 1} pulse(s) "
+                  f"({_last_assert_seq} -> {seq})")
+
+        _last_assert_seq = seq
+        _last_pulse_time = pulse_time
+        return pulse_time
 
 
 camera_thread = None
+camera_thread_lock = threading.Lock()
 stop_camera_thread = threading.Event()
 
-# Queue for offloading disk I/O from the timing-critical capture loop
-_save_queue = queue.Queue()
+# Queue for offloading disk I/O from the timing-critical capture loop.
+# A single, long-lived writer thread is started at process startup so we
+# don't leak a new writer thread every time the camera is toggled.
+_save_queue: "queue.Queue" = queue.Queue()
+_writer_thread_started = False
+_writer_thread_lock = threading.Lock()
 
 def _image_writer():
     """Background thread that drains _save_queue and writes images + metadata to disk."""
     while True:
         item = _save_queue.get()
-        if item is None:  # poison pill
-            break
-        file_name, frame, metadata = item
         try:
-            cv2.imwrite(os.path.join(IMAGE_SAVE_DIR, f'{file_name}.jpg'), frame)
-            with open(os.path.join(IMAGE_SAVE_DIR, f'{file_name}.json'), 'w') as f:
-                json.dump(metadata, f)
-        except Exception as e:
-            print(f"WARN: Failed to save {file_name}: {e}")
+            if item is None:  # poison pill (only used at process shutdown)
+                break
+            file_name, frame, metadata = item
+            try:
+                cv2.imwrite(os.path.join(IMAGE_SAVE_DIR, f'{file_name}.jpg'), frame)
+                with open(os.path.join(IMAGE_SAVE_DIR, f'{file_name}.json'), 'w') as f:
+                    json.dump(metadata, f)
+            except Exception as e:
+                print(f"WARN: Failed to save {file_name}: {e}")
         finally:
             _save_queue.task_done()
+
+def _ensure_writer_thread() -> None:
+    """Start the singleton image-writer thread on first use."""
+    global _writer_thread_started
+    with _writer_thread_lock:
+        if _writer_thread_started:
+            return
+        threading.Thread(target=_image_writer, daemon=True, name="image-writer").start()
+        _writer_thread_started = True
 
 @app.route("/toggle_camera", methods=["POST"])
 def toggle_camera():
     global image_number
     global is_camera_on
     global camera_thread
-    global stop_camera_thread
 
     try:
         json_data = request.json
-        is_camera_on = json_data["is_camera_on"]
-        image_number = json_data["image_count"]
-        print("SUCCESS")
-   
+        requested_state = bool(json_data["is_camera_on"])
+        image_number = int(json_data["image_count"])
     except Exception as e:
-        print("Could not interpret `is_camera_on` value from API request.")
-        print(e)
+        print("Could not interpret toggle_camera payload:", e)
+        return jsonify({"error": "Invalid payload"}), 400
 
-    if is_camera_on:
-        if camera_thread is None or not camera_thread.is_alive():
+    # Serialise toggle handling so off/on bursts cannot leave is_camera_on=True
+    # with no live capture thread (or vice versa).
+    with camera_thread_lock:
+        is_camera_on = requested_state
+        if requested_state:
+            # Wait for any prior thread to finish before starting a new one.
+            if camera_thread is not None and camera_thread.is_alive():
+                stop_camera_thread.set()
+                camera_thread.join(timeout=5)
             stop_camera_thread.clear()
-            camera_thread = threading.Thread(target=continuously_capture_images)
+            _ensure_writer_thread()
+            camera_thread = threading.Thread(
+                target=continuously_capture_images, name="camera-capture", daemon=True,
+            )
             camera_thread.start()
             print("Starting camera")
-    else:
-        print("Stopping Camera")
-        stop_camera_thread.set()
+        else:
+            print("Stopping Camera")
+            stop_camera_thread.set()
 
-    return { "message": "Success!"}, 200
+    return jsonify({"message": "Success!"}), 200
 
 def continuously_capture_images():
     global camera_connection
@@ -383,12 +491,16 @@ def continuously_capture_images():
             print("ERROR: Could not open camera")
             return
 
-    # Start the background writer thread for disk I/O
-    writer = threading.Thread(target=_image_writer, daemon=True)
-    writer.start()
-
     print("Camera ready, waiting for PPS pulses.")
-    pps_fd = _pps_open()
+    try:
+        pps_fd = _pps_open()
+    except OSError as e:
+        print(f"ERROR: Could not open {PPS_DEVICE}: {e}")
+        if camera_connection is not None:
+            camera_connection.release()
+            camera_connection = None
+        return
+
     try:
         while not stop_camera_thread.is_set():
             pulse_time = wait_for_pulse(pps_fd)
@@ -404,9 +516,9 @@ def continuously_capture_images():
             take_picture(image_number, camera_connection, vehicle_data_snapshot)
     finally:
         os.close(pps_fd)
-        # Drain the save queue before releasing the camera
+        # Drain pending writes; the writer thread is shared and long-lived,
+        # so we do NOT send a poison pill here.
         _save_queue.join()
-        _save_queue.put(None)  # stop the writer thread
         if camera_connection is not None:
             camera_connection.release()
             camera_connection = None
@@ -437,20 +549,30 @@ def receive_vehicle_position():  # Actively runs and receives live vehicle data 
 
     sock.bind(("127.0.0.1", 5005))
     while True:
-        data = sock.recvfrom(1024)
-        items = data[0].decode()[1:-1].split(",")
-        message_time = float(items[0])
-
-        if message_time <= vehicle_data["last_time"]:
+        try:
+            data = sock.recvfrom(1024)
+            items = data[0].decode().strip()[1:-1].split(",")
+            message_time = float(items[0])
+        except (UnicodeDecodeError, ValueError, IndexError) as e:
+            print(f"WARN: malformed vehicle position datagram: {e}")
+            continue
+        except OSError as e:
+            print(f"WARN: vehicle position socket error: {e}")
             continue
 
-        if len(items) == len(vehicle_data):
-            with vehicle_data_lock:
+        if len(items) != len(vehicle_data):
+            print("Received data item does not match expected length...")
+            continue
+
+        with vehicle_data_lock:
+            if message_time <= vehicle_data["last_time"]:
+                continue
+            try:
                 vehicle_data["last_time"] = message_time
                 for i, key in enumerate(_vehicle_keys, start=1):
                     vehicle_data[key] = float(items[i])
-        else:
-            print(f"Received data item does not match expected length...")
+            except ValueError as e:
+                print(f"WARN: failed to parse vehicle field: {e}")
 
 if __name__ == "__main__":
     # Need to take a parameter off of the command line to determine if we are a plane or copter 
