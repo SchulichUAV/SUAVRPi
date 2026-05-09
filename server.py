@@ -3,9 +3,7 @@
 
 from flask import Flask, jsonify, request
 from flask_cors import CORS
-# from adafruit_servokit import ServoKit  # disabled for testing (no PCA9685 connected)
-from gpiozero import Servo
-from time import sleep
+from adafruit_servokit import ServoKit
 import cv2
 import threading
 import queue
@@ -219,8 +217,7 @@ def monitor_mission_and_drop():
                         break
 
                 # Drop the payload
-                # mission.check_distance_and_drop(vehicle_connection, bay - 1, kit, vehicle_data)  # disabled for testing
-                print(f"[TEST] Skipping payload drop for bay {bay} (servo kit disabled)")
+                mission.check_distance_and_drop(vehicle_connection, bay - 1, kit, vehicle_data)
                 print(f"Payload drop completed for bay {bay}")
             except Exception as drop_error:
                 print(f"[Background Thread] Error in mission drop: {drop_error}")
@@ -247,11 +244,7 @@ def payload_manual_control():
 
     if 1 <= payload_id <= 4:
         try:
-            # payload.set_servo_state(payload_id - 1, payload_open)  # disabled for testing
-            if payload_open:
-                _test_servo_open(f"payload_manual_control bay={payload_id} open=True")
-            else:
-                _test_servo_close(f"payload_manual_control bay={payload_id} open=False")
+            payload.set_servo_state(payload_id - 1, payload_open)
         except Exception as e:
             print("Could not set servo state:", e)
             return jsonify({'error': "Failed to set servo state."}), 400
@@ -271,8 +264,7 @@ def payload_release():
         return jsonify({'error': 'Invalid bay (must be an integer from 1 to 4).'}), 400
 
     try:
-        # payload.payload_release(kit, payload_id - 1, vehicle_data)  # disabled for testing
-        _test_servo_open(f"payload_release bay={payload_id}")
+        payload.payload_release(kit, payload_id - 1, vehicle_data)
     except Exception as e:
         print("Could not release payload:", e)
         return jsonify({'error': "Failed to release payload."}), 400
@@ -282,8 +274,7 @@ def payload_release():
 @app.route('/payload_release_all', methods=["POST"])
 def payload_release_all():
     try:
-        # payload.release_all(kit, vehicle_data)  # disabled for testing
-        _test_servo_open("payload_release_all")
+        payload.release_all(kit, vehicle_data)
     except Exception as e:
         print("Could not release all payloads:", e)
         return jsonify({'error': "Failed to release all payloads."}), 400
@@ -293,8 +284,7 @@ def payload_release_all():
 @app.route('/payload_close_all', methods=["POST"])
 def payload_close_all():
     try:
-        # payload.close_all_servos(kit)  # disabled for testing
-        _test_servo_close("payload_close_all")
+        payload.close_all_servos(kit)
     except Exception as e:
         print("Could not close all servos:", e)
         return jsonify({'error': "Failed to close all servos."}), 400
@@ -304,40 +294,12 @@ def payload_close_all():
 @app.route('/payload_open_all', methods=["POST"])
 def payload_open_all():
     try:
-        # payload.open_all_servos(kit)  # disabled for testing
-        _test_servo_open("payload_open_all")
+        payload.open_all_servos(kit)
     except Exception as e:
         print("Could not open all servos:", e)
         return jsonify({'error': "Failed to open all servos."}), 400
 
     return jsonify({'message': 'All servos opened successfully'}), 200
-
-# Test servo on GPIO 13 (gpiozero) — stand-in for the PCA9685 payload board.
-# Created lazily so the import alone doesn't claim the GPIO line.
-_test_servo_pin = 13
-_test_servo = None
-_test_servo_lock = threading.Lock()
-
-def _get_test_servo():
-    global _test_servo
-    with _test_servo_lock:
-        if _test_servo is None:
-            _test_servo = Servo(_test_servo_pin)
-        return _test_servo
-
-def _test_servo_open(label: str) -> None:
-    """Move the test servo to the OPEN position (+90°)."""
-    servo = _get_test_servo()
-    print(f"[TEST] {label}: Servo({_test_servo_pin}).max() (open)")
-    servo.max()
-    sleep(1)
-
-def _test_servo_close(label: str) -> None:
-    """Move the test servo to the CLOSED position (0° / mid)."""
-    servo = _get_test_servo()
-    print(f"[TEST] {label}: Servo({_test_servo_pin}).mid() (close)")
-    servo.mid()
-    sleep(1)
 
 @app.route('/payload_open', methods=["POST"])
 def payload_open():
@@ -349,8 +311,7 @@ def payload_open():
         return jsonify({'error': 'Invalid bay (must be an integer from 1 to 4).'}), 400
 
     try:
-        # payload.open_servo(kit, payload_id - 1)  # disabled for testing
-        _test_servo_open(f"payload_open bay={payload_id}")
+        payload.open_servo(kit, payload_id - 1)
     except Exception as e:
         print("Could not open servo:", e)
         return jsonify({'error': "Failed to open servo."}), 400
@@ -367,8 +328,7 @@ def payload_close():
         return jsonify({'error': 'Invalid bay (must be an integer from 1 to 4).'}), 400
 
     try:
-        # payload.close_servo(kit, payload_id - 1)  # disabled for testing
-        _test_servo_close(f"payload_close bay={payload_id}")
+        payload.close_servo(kit, payload_id - 1)
     except Exception as e:
         print("Could not close servo:", e)
         return jsonify({'error': "Failed to close servo."}), 400
@@ -633,8 +593,7 @@ def receive_vehicle_position():  # Actively runs and receives live vehicle data 
 
 if __name__ == "__main__":
     # Need to take a parameter off of the command line to determine if we are a plane or copter 
-    # kit = ServoKit(channels=16)  # disabled for testing
-    kit = None
+    kit = ServoKit(channels=16)
 
     os.makedirs(IMAGE_SAVE_DIR, exist_ok=True)
 
