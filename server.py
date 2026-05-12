@@ -22,10 +22,9 @@ import modules.AutopilotDevelopment.Plane.Operations.altitude as autopilot_altit
 import modules.payload as payload
 
 
-GCS_URL = "http://192.168.1.64:80"
 VEHICLE_PORT = "udp:127.0.0.1:5006"
 PPS_DEVICE = "/dev/pps0"  # kernel PPS driver via dtoverlay=pps-gpio,gpiopin=4
-CAMERA_USB_PORT = 0
+CAMERA_DEVICE = "/dev/video0"
 
 # ── Kernel PPSAPI (linux/pps.h) ──────────────────────────────────────────────
 class _PPSKTime(ctypes.Structure):
@@ -46,19 +45,13 @@ class _PPSFData(ctypes.Structure):
 def _ioctl_nr(direction, nr, size):
     return (direction << 30) | (ord('p') << 8) | nr | (size << 16)
 
-# PPS ioctls use pointer types in the UAPI header, so the encoded size is
+# PPS ioctl uses a pointer type in the UAPI header, so the encoded size is
 # sizeof(pointer) = 8 on 64-bit, not sizeof(struct pps_fdata).
-_PPS_FETCH       = _ioctl_nr(3, 0xa4, ctypes.sizeof(ctypes.c_void_p))   # _IOWR
-_PPS_GETPARAMS   = _ioctl_nr(2, 0xa1, ctypes.sizeof(ctypes.c_void_p))   # _IOR
-_PPS_SETPARAMS   = _ioctl_nr(1, 0xa2, ctypes.sizeof(ctypes.c_void_p))   # _IOW
-
-# PPS mode flags (from linux/pps.h)
-_PPS_CAPTUREASSERT = 0x01
-_PPS_OFFSETASSERT  = 0x10
-_PPS_TSFMT_TSPEC   = 0x1000
+_PPS_FETCH = _ioctl_nr(3, 0xa4, ctypes.sizeof(ctypes.c_void_p))   # _IOWR
 
 # Configured PPS rate (Hz). Used as a debounce floor against spurious extra
-# wake-ups (e.g. line glitches, double-edge captures).
+# wake-ups (e.g. line glitches, falling-edge captures when the driver is in
+# capture-both mode).
 PPS_HZ = 10
 _PPS_MIN_INTERVAL_S = 0.5 / PPS_HZ  # accept pulses no more than 2x rate
 
@@ -66,57 +59,21 @@ _last_assert_seq = None
 _last_pulse_time = 0.0
 
 
-class _PPSKParams(ctypes.Structure):
-    _fields_ = [
-        ("api_version", ctypes.c_int),
-        ("mode",        ctypes.c_int),
-        ("assert_off_tu", _PPSKTime),
-        ("clear_off_tu",  _PPSKTime),
-    ]
-
-
-def _pps_configure_assert_only(pps_fd: int) -> None:
-    """Force the PPS source into assert-only capture mode.
-
-    The pps-gpio driver advertises PPS_CAPTUREBOTH by default; on a noisy
-    GPIO line that can produce extra wake-ups beyond the configured pulse
-    rate. We explicitly clear the clear-edge capture so only rising-edge
-    events advance assert_sequence and wake PPS_FETCH waiters.
-    """
-    params = _PPSKParams()
-    try:
-        fcntl.ioctl(pps_fd, _PPS_GETPARAMS, params)
-    except OSError as e:
-        print(f"WARN: PPS_GETPARAMS failed ({e}); using defaults")
-        params.api_version = 1
-        params.mode = 0
-    # Keep only assert capture + offset/format flags. Drop any clear/both bits.
-    params.mode = (params.mode & _PPS_TSFMT_TSPEC) | _PPS_CAPTUREASSERT | _PPS_OFFSETASSERT | _PPS_TSFMT_TSPEC
-    try:
-        fcntl.ioctl(pps_fd, _PPS_SETPARAMS, params)
-    except OSError as e:
-        print(f"WARN: PPS_SETPARAMS failed ({e}); continuing with current mode")
-
-
 def _pps_open() -> int:
-    """Open PPS_DEVICE and force assert-only capture."""
+    """Open PPS_DEVICE and reset per-session debounce state."""
     global _last_assert_seq, _last_pulse_time
     _last_assert_seq = None
     _last_pulse_time = 0.0
     # Zero the shared ioctl buffer so a stale assert_sequence from a previous
     # session can never seed _last_assert_seq.
     ctypes.memset(ctypes.addressof(_pps_fdata), 0, ctypes.sizeof(_pps_fdata))
-    fd = os.open(PPS_DEVICE, os.O_RDWR)
-    _pps_configure_assert_only(fd)
-    return fd
+    return os.open(PPS_DEVICE, os.O_RDWR)
 # ─────────────────────────────────────────────────────────────────────────────
 IMAGE_SAVE_DIR = "/home/suavgeopi/images"
 
 camera_connection = None
 vehicle_connection = None
-is_camera_on = False
 image_number = 0
-vehicle = None
 
 kit = None
 
@@ -395,10 +352,10 @@ def wait_for_pulse(pps_fd: int) -> float:
             continue
 
         # Debounce: ignore pulses arriving suspiciously close to the previous one.
+        # In capture-both mode this also rejects the falling edge of every legitimate
+        # pulse (expected, not an error), so we don't log it.
         delta = pulse_time - _last_pulse_time
         if delta > 0 and delta < _PPS_MIN_INTERVAL_S:
-            print(f"WARN: spurious PPS event (delta={delta*1000:.2f} ms, "
-                  f"seq {_last_assert_seq}->{seq}); ignoring")
             _last_assert_seq = seq
             continue
 
@@ -453,7 +410,6 @@ def _ensure_writer_thread() -> None:
 @app.route("/toggle_camera", methods=["POST"])
 def toggle_camera():
     global image_number
-    global is_camera_on
     global camera_thread
 
     try:
@@ -464,10 +420,9 @@ def toggle_camera():
         print("Could not interpret toggle_camera payload:", e)
         return jsonify({"error": "Invalid payload"}), 400
 
-    # Serialise toggle handling so off/on bursts cannot leave is_camera_on=True
+    # Serialise toggle handling so off/on bursts cannot leave the camera enabled
     # with no live capture thread (or vice versa).
     with camera_thread_lock:
-        is_camera_on = requested_state
         if requested_state:
             # Wait for any prior thread to finish before starting a new one.
             # If it refuses to exit, refuse to start a new one rather than
@@ -477,7 +432,6 @@ def toggle_camera():
                 camera_thread.join(timeout=5)
                 if camera_thread.is_alive():
                     print("ERROR: previous camera thread did not exit; refusing to start a new one")
-                    is_camera_on = False
                     return jsonify({
                         "error": "Previous camera thread is still running. "
                                  "Check PPS signal / camera USB and try again.",
@@ -501,11 +455,26 @@ def continuously_capture_images():
 
     if camera_connection is None or not camera_connection.isOpened():
         print("Initializing camera...")
-        camera_connection = cv2.VideoCapture(CAMERA_USB_PORT)
+        camera_connection = cv2.VideoCapture(CAMERA_DEVICE, cv2.CAP_V4L2)
+
+        camera_connection.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+        camera_connection.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        camera_connection.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        camera_connection.set(cv2.CAP_PROP_FPS, 30)
         camera_connection.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
         if not camera_connection.isOpened():
             print("ERROR: Could not open camera")
             return
+
+        # Optional: throw away a few startup frames
+        for _ in range(5):
+            camera_connection.read()
+
+        print("Camera opened with:")
+        print("Width:", camera_connection.get(cv2.CAP_PROP_FRAME_WIDTH))
+        print("Height:", camera_connection.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        print("FPS:", camera_connection.get(cv2.CAP_PROP_FPS))
 
     print("Camera ready, waiting for PPS pulses.")
     try:
