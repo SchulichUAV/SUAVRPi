@@ -19,6 +19,7 @@ import modules.AutopilotDevelopment.General.Operations.initialize as initialize
 import modules.AutopilotDevelopment.General.Operations.mode as autopilot_mode
 import modules.AutopilotDevelopment.General.Operations.mission as mission
 import modules.AutopilotDevelopment.Plane.Operations.altitude as autopilot_altitude
+import modules.image_sequence as image_sequence
 import modules.payload as payload
 
 
@@ -70,6 +71,7 @@ def _pps_open() -> int:
     return os.open(PPS_DEVICE, os.O_RDWR)
 # ─────────────────────────────────────────────────────────────────────────────
 IMAGE_SAVE_DIR = "/home/suavgeopi/images"
+capture_sequence = image_sequence.CaptureFileSequence(IMAGE_SAVE_DIR)
 
 camera_connection = None
 vehicle_connection = None
@@ -388,13 +390,16 @@ def _image_writer():
         try:
             if item is None:  # poison pill (only used at process shutdown)
                 break
-            file_name, frame, metadata = item
+            capture_files, frame, metadata = item
             try:
-                cv2.imwrite(os.path.join(IMAGE_SAVE_DIR, f'{file_name}.jpg'), frame)
-                with open(os.path.join(IMAGE_SAVE_DIR, f'{file_name}.json'), 'w') as f:
+                os.makedirs(IMAGE_SAVE_DIR, exist_ok=True)
+                if not cv2.imwrite(capture_files.image_path, frame):
+                    raise OSError(f"cv2.imwrite returned false for {capture_files.image_path}")
+                with open(capture_files.metadata_path, 'w') as f:
                     json.dump(metadata, f)
+                capture_sequence.remember_saved(capture_files.number)
             except Exception as e:
-                print(f"WARN: Failed to save {file_name}: {e}")
+                print(f"WARN: Failed to save {capture_files.stem}: {e}")
         finally:
             _save_queue.task_done()
 
@@ -415,7 +420,7 @@ def toggle_camera():
     try:
         json_data = request.json
         requested_state = bool(json_data["is_camera_on"])
-        image_number = int(json_data["image_count"])
+        client_image_count = int(json_data.get("image_count", 0) or 0)
     except Exception as e:
         print("Could not interpret toggle_camera payload:", e)
         return jsonify({"error": "Invalid payload"}), 400
@@ -436,13 +441,14 @@ def toggle_camera():
                         "error": "Previous camera thread is still running. "
                                  "Check PPS signal / camera USB and try again.",
                     }), 503
+            image_number = capture_sequence.last_saved_number(client_image_count)
             stop_camera_thread.clear()
             _ensure_writer_thread()
             camera_thread = threading.Thread(
                 target=continuously_capture_images, name="camera-capture", daemon=True,
             )
             camera_thread.start()
-            print("Starting camera")
+            print(f"Starting camera at {capture_sequence.files_for(image_number + 1).stem}")
         else:
             print("Stopping Camera")
             stop_camera_thread.set()
@@ -514,11 +520,11 @@ def take_picture(image_number, camera_connection, metadata):
         print(f"WARN: Failed to capture frame {image_number}")
         return
 
-    file_name = f'{image_number:05d}'
-    print(f"DEBUG: Image {file_name} captured ({frame.shape[1]}x{frame.shape[0]}), queuing write")
+    capture_files = capture_sequence.files_for(image_number)
+    print(f"DEBUG: Image {capture_files.stem} captured ({frame.shape[1]}x{frame.shape[0]}), queuing write")
 
     # Enqueue for async disk write — keeps the capture loop tight
-    _save_queue.put((file_name, frame, metadata))
+    _save_queue.put((capture_files, frame, metadata))
 
 @app.route("/heartbeat-validate")
 def heartbeat_validate():
