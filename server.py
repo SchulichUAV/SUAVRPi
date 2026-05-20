@@ -33,7 +33,7 @@ PPS_DEVICE = "/dev/pps0"  # kernel PPS driver via dtoverlay=pps-gpio,gpiopin=4
 GCS_URL - Depends which IP the laptop appears as on the network. Use ifconfig/ipconfig to check.
 CAMERA_DEVICE - Depends on which USB port the camera is plugged into. Check with `v4l2-ctl --list-devices` and look for the /dev/video* entry under the correct camera.
 '''
-GCS_URL = "http://192.168.1.66:80"
+GCS_URL = "http://192.168.1.65:80"
 CAMERA_DEVICE = "/dev/video0"
 
 # Manual exposure (shutter) settings. The camera is mounted on a moving
@@ -447,6 +447,7 @@ def toggle_camera():
     try:
         json_data = request.json
         requested_state = bool(json_data["is_camera_on"])
+        amount_of_existing_images = int(json_data["image_count"])
     except Exception as e:
         print("Could not interpret toggle_camera payload:", e)
         return jsonify({"error": "Invalid payload"}), 400
@@ -465,7 +466,7 @@ def toggle_camera():
                         "error": "Previous camera thread is still running. "
                                  "Check PPS signal / camera USB and try again.",
                     }), 503
-            image_number = 0
+            image_number = amount_of_existing_images + 1
             stop_camera_thread.clear()
             _ensure_writer_thread()
             camera_thread = threading.Thread(
