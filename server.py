@@ -27,6 +27,11 @@ VEHICLE_PORT = "udp:127.0.0.1:5006"
 PPS_DEVICE = "/dev/pps0"  # kernel PPS driver via dtoverlay=pps-gpio,gpiopin=4
 CAMERA_DEVICE = "/dev/video0"
 
+# Manual exposure (shutter) settings. The camera is mounted on a moving
+# aircraft, so leaving exposure on auto produces motion-blurred frames.
+# UVC/V4L2 expresses exposure_absolute in units of 100 µs.
+CAMERA_EXPOSURE = 1   # 1 * 100µs = 100 µs shutter
+
 # ── Kernel PPSAPI (linux/pps.h) ──────────────────────────────────────────────
 class _PPSKTime(ctypes.Structure):
     _fields_ = [("sec", ctypes.c_int64), ("nsec", ctypes.c_int32), ("flags", ctypes.c_uint32)]
@@ -469,6 +474,15 @@ def continuously_capture_images():
         camera_connection.set(cv2.CAP_PROP_FPS, 30)
         camera_connection.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
+        # Force manual exposure so aircraft motion does not cause motion blur.
+        # On V4L2 UVC cameras CAP_PROP_AUTO_EXPOSURE uses 1=manual, 3=aperture-priority/auto.
+        # Set auto-exposure OFF *before* writing CAP_PROP_EXPOSURE, otherwise
+        # the driver silently ignores the manual exposure value.
+        if not camera_connection.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1):
+            print("WARN: failed to disable auto-exposure; manual shutter may not apply")
+        if not camera_connection.set(cv2.CAP_PROP_EXPOSURE, CAMERA_EXPOSURE):
+            print(f"WARN: failed to set manual exposure to {CAMERA_EXPOSURE}")
+
         if not camera_connection.isOpened():
             print("ERROR: Could not open camera")
             return
@@ -481,6 +495,10 @@ def continuously_capture_images():
         print("Width:", camera_connection.get(cv2.CAP_PROP_FRAME_WIDTH))
         print("Height:", camera_connection.get(cv2.CAP_PROP_FRAME_HEIGHT))
         print("FPS:", camera_connection.get(cv2.CAP_PROP_FPS))
+        print("Auto-exposure mode:", camera_connection.get(cv2.CAP_PROP_AUTO_EXPOSURE))
+        print("Exposure:", camera_connection.get(cv2.CAP_PROP_EXPOSURE))
+        print("Gain:", camera_connection.get(cv2.CAP_PROP_GAIN))
+        print("Gain:", camera_connection.get(cv2.CAP_PROP_GAIN))
 
     print("Camera ready, waiting for PPS pulses.")
     try:
