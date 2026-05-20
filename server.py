@@ -14,17 +14,24 @@ import json
 import sys
 import time
 import os
+import subprocess
 
 import modules.AutopilotDevelopment.General.Operations.initialize as initialize
 import modules.AutopilotDevelopment.General.Operations.mode as autopilot_mode
 import modules.AutopilotDevelopment.General.Operations.mission as mission
 import modules.AutopilotDevelopment.Plane.Operations.altitude as autopilot_altitude
+import modules.image_sequence as image_sequence
 import modules.payload as payload
 
 
 VEHICLE_PORT = "udp:127.0.0.1:5006"
 PPS_DEVICE = "/dev/pps0"  # kernel PPS driver via dtoverlay=pps-gpio,gpiopin=4
 CAMERA_DEVICE = "/dev/video0"
+
+# Manual exposure (shutter) settings. The camera is mounted on a moving
+# aircraft, so leaving exposure on auto produces motion-blurred frames.
+# UVC/V4L2 expresses exposure_absolute in units of 100 µs.
+CAMERA_EXPOSURE = 1   # 1 * 100µs = 100 µs shutter
 
 # ── Kernel PPSAPI (linux/pps.h) ──────────────────────────────────────────────
 class _PPSKTime(ctypes.Structure):
@@ -70,6 +77,7 @@ def _pps_open() -> int:
     return os.open(PPS_DEVICE, os.O_RDWR)
 # ─────────────────────────────────────────────────────────────────────────────
 IMAGE_SAVE_DIR = "/home/suavgeopi/images"
+capture_sequence = image_sequence.CaptureFileSequence(IMAGE_SAVE_DIR)
 
 camera_connection = None
 vehicle_connection = None
@@ -388,13 +396,16 @@ def _image_writer():
         try:
             if item is None:  # poison pill (only used at process shutdown)
                 break
-            file_name, frame, metadata = item
+            capture_files, frame, metadata = item
             try:
-                cv2.imwrite(os.path.join(IMAGE_SAVE_DIR, f'{file_name}.jpg'), frame)
-                with open(os.path.join(IMAGE_SAVE_DIR, f'{file_name}.json'), 'w') as f:
+                os.makedirs(IMAGE_SAVE_DIR, exist_ok=True)
+                if not cv2.imwrite(capture_files.image_path, frame):
+                    raise OSError(f"cv2.imwrite returned false for {capture_files.image_path}")
+                with open(capture_files.metadata_path, 'w') as f:
                     json.dump(metadata, f)
+                capture_sequence.remember_saved(capture_files.number)
             except Exception as e:
-                print(f"WARN: Failed to save {file_name}: {e}")
+                print(f"WARN: Failed to save {capture_files.stem}: {e}")
         finally:
             _save_queue.task_done()
 
@@ -415,7 +426,7 @@ def toggle_camera():
     try:
         json_data = request.json
         requested_state = bool(json_data["is_camera_on"])
-        image_number = int(json_data["image_count"])
+        client_image_count = int(json_data.get("image_count", 0) or 0)
     except Exception as e:
         print("Could not interpret toggle_camera payload:", e)
         return jsonify({"error": "Invalid payload"}), 400
@@ -436,18 +447,59 @@ def toggle_camera():
                         "error": "Previous camera thread is still running. "
                                  "Check PPS signal / camera USB and try again.",
                     }), 503
+            image_number = capture_sequence.last_saved_number(client_image_count)
             stop_camera_thread.clear()
             _ensure_writer_thread()
             camera_thread = threading.Thread(
                 target=continuously_capture_images, name="camera-capture", daemon=True,
             )
             camera_thread.start()
-            print("Starting camera")
+            print(f"Starting camera at {capture_sequence.files_for(image_number + 1).stem}")
         else:
             print("Stopping Camera")
             stop_camera_thread.set()
 
     return jsonify({"message": "Success!"}), 200
+
+def _v4l2_set(device: str, control: str, value) -> bool:
+    """Set a single V4L2 control via v4l2-ctl. Returns True on success."""
+    try:
+        result = subprocess.run(
+            ["v4l2-ctl", "-d", device, "--set-ctrl", f"{control}={value}"],
+            capture_output=True, text=True, timeout=2,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+        print(f"WARN: v4l2-ctl unavailable for {control}={value}: {e}")
+        return False
+    if result.returncode != 0:
+        # Driver will complain on stderr if the control name isn't recognised.
+        return False
+    return True
+
+def _apply_manual_exposure(device: str, exposure_units: int) -> None:
+    """Force manual exposure on a UVC camera, trying both UAPI naming schemes."""
+    # auto-exposure: 1 = Manual Mode, 3 = Aperture Priority Mode (auto).
+    if not (_v4l2_set(device, "auto_exposure", 1)
+            or _v4l2_set(device, "exposure_auto", 1)):
+        print("WARN: could not disable auto-exposure via v4l2-ctl; "
+              "manual shutter may not take effect")
+        return
+    if not (_v4l2_set(device, "exposure_time_absolute", exposure_units)
+            or _v4l2_set(device, "exposure_absolute", exposure_units)):
+        print(f"WARN: could not set manual exposure to {exposure_units} via v4l2-ctl")
+
+def _print_exposure_state(device: str) -> None:
+    """Log the camera's current exposure controls for verification."""
+    try:
+        result = subprocess.run(
+            ["v4l2-ctl", "-d", device, "--get-ctrl",
+             "auto_exposure,exposure_time_absolute,exposure_auto,exposure_absolute"],
+            capture_output=True, text=True, timeout=2,
+        )
+        if result.stdout:
+            print("Exposure controls:\n" + result.stdout.strip())
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
 
 def continuously_capture_images():
     global camera_connection
@@ -455,6 +507,16 @@ def continuously_capture_images():
 
     if camera_connection is None or not camera_connection.isOpened():
         print("Initializing camera...")
+
+        # Configure manual exposure via v4l2-ctl BEFORE opening the device.
+        # OpenCV's V4L2 backend frequently fails to set auto-exposure
+        # (cap.set returns False and the control is silently ignored),
+        # so drive the UVC controls directly. Some kernels expose the
+        # controls as auto_exposure / exposure_time_absolute (newer UVC
+        # driver) and some as exposure_auto / exposure_absolute (older).
+        # Try both and accept whichever the driver accepts.
+        _apply_manual_exposure(CAMERA_DEVICE, CAMERA_EXPOSURE)
+
         camera_connection = cv2.VideoCapture(CAMERA_DEVICE, cv2.CAP_V4L2)
 
         camera_connection.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
@@ -462,6 +524,9 @@ def continuously_capture_images():
         camera_connection.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
         camera_connection.set(cv2.CAP_PROP_FPS, 30)
         camera_connection.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+        # Re-apply after open: opening the device can reset UVC controls on some drivers.
+        _apply_manual_exposure(CAMERA_DEVICE, CAMERA_EXPOSURE)
 
         if not camera_connection.isOpened():
             print("ERROR: Could not open camera")
@@ -475,6 +540,8 @@ def continuously_capture_images():
         print("Width:", camera_connection.get(cv2.CAP_PROP_FRAME_WIDTH))
         print("Height:", camera_connection.get(cv2.CAP_PROP_FRAME_HEIGHT))
         print("FPS:", camera_connection.get(cv2.CAP_PROP_FPS))
+        _print_exposure_state(CAMERA_DEVICE)
+        print("Gain:", camera_connection.get(cv2.CAP_PROP_GAIN))
 
     print("Camera ready, waiting for PPS pulses.")
     try:
@@ -514,11 +581,11 @@ def take_picture(image_number, camera_connection, metadata):
         print(f"WARN: Failed to capture frame {image_number}")
         return
 
-    file_name = f'{image_number:05d}'
-    print(f"DEBUG: Image {file_name} captured ({frame.shape[1]}x{frame.shape[0]}), queuing write")
+    capture_files = capture_sequence.files_for(image_number)
+    print(f"DEBUG: Image {capture_files.stem} captured ({frame.shape[1]}x{frame.shape[0]}), queuing write")
 
     # Enqueue for async disk write — keeps the capture loop tight
-    _save_queue.put((file_name, frame, metadata))
+    _save_queue.put((capture_files, frame, metadata))
 
 @app.route("/heartbeat-validate")
 def heartbeat_validate():
