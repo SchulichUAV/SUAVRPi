@@ -14,6 +14,7 @@ import json
 import sys
 import time
 import os
+import subprocess
 
 import modules.AutopilotDevelopment.General.Operations.initialize as initialize
 import modules.AutopilotDevelopment.General.Operations.mode as autopilot_mode
@@ -460,12 +461,62 @@ def toggle_camera():
 
     return jsonify({"message": "Success!"}), 200
 
+def _v4l2_set(device: str, control: str, value) -> bool:
+    """Set a single V4L2 control via v4l2-ctl. Returns True on success."""
+    try:
+        result = subprocess.run(
+            ["v4l2-ctl", "-d", device, "--set-ctrl", f"{control}={value}"],
+            capture_output=True, text=True, timeout=2,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+        print(f"WARN: v4l2-ctl unavailable for {control}={value}: {e}")
+        return False
+    if result.returncode != 0:
+        # Driver will complain on stderr if the control name isn't recognised.
+        return False
+    return True
+
+def _apply_manual_exposure(device: str, exposure_units: int) -> None:
+    """Force manual exposure on a UVC camera, trying both UAPI naming schemes."""
+    # auto-exposure: 1 = Manual Mode, 3 = Aperture Priority Mode (auto).
+    if not (_v4l2_set(device, "auto_exposure", 1)
+            or _v4l2_set(device, "exposure_auto", 1)):
+        print("WARN: could not disable auto-exposure via v4l2-ctl; "
+              "manual shutter may not take effect")
+        return
+    if not (_v4l2_set(device, "exposure_time_absolute", exposure_units)
+            or _v4l2_set(device, "exposure_absolute", exposure_units)):
+        print(f"WARN: could not set manual exposure to {exposure_units} via v4l2-ctl")
+
+def _print_exposure_state(device: str) -> None:
+    """Log the camera's current exposure controls for verification."""
+    try:
+        result = subprocess.run(
+            ["v4l2-ctl", "-d", device, "--get-ctrl",
+             "auto_exposure,exposure_time_absolute,exposure_auto,exposure_absolute"],
+            capture_output=True, text=True, timeout=2,
+        )
+        if result.stdout:
+            print("Exposure controls:\n" + result.stdout.strip())
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+
 def continuously_capture_images():
     global camera_connection
     global image_number
 
     if camera_connection is None or not camera_connection.isOpened():
         print("Initializing camera...")
+
+        # Configure manual exposure via v4l2-ctl BEFORE opening the device.
+        # OpenCV's V4L2 backend frequently fails to set auto-exposure
+        # (cap.set returns False and the control is silently ignored),
+        # so drive the UVC controls directly. Some kernels expose the
+        # controls as auto_exposure / exposure_time_absolute (newer UVC
+        # driver) and some as exposure_auto / exposure_absolute (older).
+        # Try both and accept whichever the driver accepts.
+        _apply_manual_exposure(CAMERA_DEVICE, CAMERA_EXPOSURE)
+
         camera_connection = cv2.VideoCapture(CAMERA_DEVICE, cv2.CAP_V4L2)
 
         camera_connection.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
@@ -474,14 +525,8 @@ def continuously_capture_images():
         camera_connection.set(cv2.CAP_PROP_FPS, 30)
         camera_connection.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
-        # Force manual exposure so aircraft motion does not cause motion blur.
-        # On V4L2 UVC cameras CAP_PROP_AUTO_EXPOSURE uses 1=manual, 3=aperture-priority/auto.
-        # Set auto-exposure OFF *before* writing CAP_PROP_EXPOSURE, otherwise
-        # the driver silently ignores the manual exposure value.
-        if not camera_connection.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1):
-            print("WARN: failed to disable auto-exposure; manual shutter may not apply")
-        if not camera_connection.set(cv2.CAP_PROP_EXPOSURE, CAMERA_EXPOSURE):
-            print(f"WARN: failed to set manual exposure to {CAMERA_EXPOSURE}")
+        # Re-apply after open: opening the device can reset UVC controls on some drivers.
+        _apply_manual_exposure(CAMERA_DEVICE, CAMERA_EXPOSURE)
 
         if not camera_connection.isOpened():
             print("ERROR: Could not open camera")
@@ -495,9 +540,7 @@ def continuously_capture_images():
         print("Width:", camera_connection.get(cv2.CAP_PROP_FRAME_WIDTH))
         print("Height:", camera_connection.get(cv2.CAP_PROP_FRAME_HEIGHT))
         print("FPS:", camera_connection.get(cv2.CAP_PROP_FPS))
-        print("Auto-exposure mode:", camera_connection.get(cv2.CAP_PROP_AUTO_EXPOSURE))
-        print("Exposure:", camera_connection.get(cv2.CAP_PROP_EXPOSURE))
-        print("Gain:", camera_connection.get(cv2.CAP_PROP_GAIN))
+        _print_exposure_state(CAMERA_DEVICE)
         print("Gain:", camera_connection.get(cv2.CAP_PROP_GAIN))
 
     print("Camera ready, waiting for PPS pulses.")
