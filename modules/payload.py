@@ -10,9 +10,17 @@ servo_map = {
     3: 12,
 }
 
+'''
+NOTE THAT THE OPEN AND CLOSE ANGLE IS DEPENDENT ON THE WAY THAT MECHANICAL ORIENTS THE SERVO.
+
+TEST ON THE GROUND WITH MECHANICAL TO ENSURE THE OPEN AND CLOSE ANGLES ARE CORRECT BEFORE FLYING WITH PAYLOADS.
+'''
+close_angle = 180 
+open_angle = 30
+
 def payload_release(kit, servo_num, vehicle_data):
     try:
-        kit.servo[servo_map[servo_num]].angle = 180
+        kit.servo[servo_map[servo_num]].angle = open_angle
         print(f"Successfully opened servo: {servo_num}. Lat: {vehicle_data['lat']}, Lon: {vehicle_data['lon']}, Alt: {vehicle_data['alt']}")
         drop_data = {
             "lat": vehicle_data["lat"],
@@ -35,7 +43,7 @@ def payload_release(kit, servo_num, vehicle_data):
             json.dump(data, f, indent=4)
         
         sleep(4)
-        kit.servo[servo_map[servo_num]].angle = 30
+        kit.servo[servo_map[servo_num]].angle = close_angle
         print(f"Successfully closed servo: {servo_num}")
     except Exception as e:
         print(f"Could not open or close servo. Error: {e}")
@@ -49,32 +57,32 @@ def release_all(kit, vehicle_data):
 
 def close_servo(kit, servo_num):
     try:
-        kit.servo[servo_map[servo_num]].angle = 30
+        kit.servo[servo_map[servo_num]].angle = close_angle
         print("Successfully closed servo.")
     except Exception as e:
         print(f"Could not close servo. Error: {e}")
 
 def open_servo(kit, servo_num):
     try:
-        kit.servo[servo_map[servo_num]].angle = 180
+        kit.servo[servo_map[servo_num]].angle = open_angle
         print("Successfully opened servo.")
     except Exception as e:
         print(f"Could not open servo. Error: {e}")
 
 def close_all_servos(kit):
     for mapped_servo in servo_map.values():
-        kit.servo[mapped_servo].angle = 30
+        kit.servo[mapped_servo].angle = close_angle
     print("All servos closed successfully.")
 
 def open_all_servos(kit):
     for mapped_servo in servo_map.values():
-        kit.servo[mapped_servo].angle = 180
+        kit.servo[mapped_servo].angle = open_angle
     print("All servos opened successfully.")
 
 def set_servo_state(servo, open):
     if open:
         print(f"Opening servo{servo}. Not automatically closing.")
-        servo.angle = 180
+        servo.angle = open_angle
     else:
         print(f"Closing servo{servo}.")
-        servo.angle = 30
+        servo.angle = close_angle

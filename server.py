@@ -4,9 +4,11 @@
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from adafruit_servokit import ServoKit
+from io import BytesIO
 import cv2
 import threading
 import queue
+import requests
 import socket
 import ctypes
 import fcntl
@@ -20,12 +22,18 @@ import modules.AutopilotDevelopment.General.Operations.initialize as initialize
 import modules.AutopilotDevelopment.General.Operations.mode as autopilot_mode
 import modules.AutopilotDevelopment.General.Operations.mission as mission
 import modules.AutopilotDevelopment.Plane.Operations.altitude as autopilot_altitude
-import modules.image_sequence as image_sequence
 import modules.payload as payload
 
 
 VEHICLE_PORT = "udp:127.0.0.1:5006"
 PPS_DEVICE = "/dev/pps0"  # kernel PPS driver via dtoverlay=pps-gpio,gpiopin=4
+
+# SETTINGS REQUIRE MANUAL TWEAK
+'''
+GCS_URL - Depends which IP the laptop appears as on the network. Use ifconfig/ipconfig to check.
+CAMERA_DEVICE - Depends on which USB port the camera is plugged into. Check with `v4l2-ctl --list-devices` and look for the /dev/video* entry under the correct camera.
+'''
+GCS_URL = "http://192.168.1.65:80"
 CAMERA_DEVICE = "/dev/video0"
 
 # Manual exposure (shutter) settings. The camera is mounted on a moving
@@ -76,8 +84,6 @@ def _pps_open() -> int:
     ctypes.memset(ctypes.addressof(_pps_fdata), 0, ctypes.sizeof(_pps_fdata))
     return os.open(PPS_DEVICE, os.O_RDWR)
 # ─────────────────────────────────────────────────────────────────────────────
-IMAGE_SAVE_DIR = "/home/suavgeopi/images"
-capture_sequence = image_sequence.CaptureFileSequence(IMAGE_SAVE_DIR)
 
 camera_connection = None
 vehicle_connection = None
@@ -382,30 +388,45 @@ camera_thread = None
 camera_thread_lock = threading.Lock()
 stop_camera_thread = threading.Event()
 
-# Queue for offloading disk I/O from the timing-critical capture loop.
+# Queue for offloading HTTP uploads from the timing-critical capture loop.
 # A single, long-lived writer thread is started at process startup so we
 # don't leak a new writer thread every time the camera is toggled.
+# Items are (file_stem, jpeg_bytes, metadata_dict).
 _save_queue: "queue.Queue" = queue.Queue()
 _writer_thread_started = False
 _writer_thread_lock = threading.Lock()
 
 def _image_writer():
-    """Background thread that drains _save_queue and writes images + metadata to disk."""
+    """Background thread that drains _save_queue and POSTs images + metadata to the GCS."""
     while True:
         item = _save_queue.get()
         try:
             if item is None:  # poison pill (only used at process shutdown)
                 break
-            capture_files, frame, metadata = item
+            file_stem, jpeg_bytes, metadata = item
             try:
-                os.makedirs(IMAGE_SAVE_DIR, exist_ok=True)
-                if not cv2.imwrite(capture_files.image_path, frame):
-                    raise OSError(f"cv2.imwrite returned false for {capture_files.image_path}")
-                with open(capture_files.metadata_path, 'w') as f:
-                    json.dump(metadata, f)
-                capture_sequence.remember_saved(capture_files.number)
-            except Exception as e:
-                print(f"WARN: Failed to save {capture_files.stem}: {e}")
+                # Send image
+                image_stream = BytesIO(jpeg_bytes)
+                response = requests.post(
+                    f"{GCS_URL}/submit",
+                    files={'file': (f'{file_stem}.jpg', image_stream, 'image/jpeg')},
+                    timeout=10,
+                )
+                if not response.ok:
+                    print(f"WARN: Image upload failed for {file_stem}: {response.status_code}")
+
+                # Send metadata
+                json_stream = BytesIO(json.dumps(metadata).encode('utf-8'))
+                response = requests.post(
+                    f"{GCS_URL}/submit",
+                    files={'file': (f'{file_stem}.json', json_stream, 'application/json')},
+                    timeout=10,
+                )
+                if not response.ok:
+                    print(f"WARN: Metadata upload failed for {file_stem}: {response.status_code}")
+
+            except requests.RequestException as e:
+                print(f"WARN: Failed to upload {file_stem}: {e}")
         finally:
             _save_queue.task_done()
 
@@ -426,7 +447,7 @@ def toggle_camera():
     try:
         json_data = request.json
         requested_state = bool(json_data["is_camera_on"])
-        client_image_count = int(json_data.get("image_count", 0) or 0)
+        amount_of_existing_images = int(json_data["image_count"])
     except Exception as e:
         print("Could not interpret toggle_camera payload:", e)
         return jsonify({"error": "Invalid payload"}), 400
@@ -436,8 +457,6 @@ def toggle_camera():
     with camera_thread_lock:
         if requested_state:
             # Wait for any prior thread to finish before starting a new one.
-            # If it refuses to exit, refuse to start a new one rather than
-            # leaving two threads racing on the shared camera + PPS globals.
             if camera_thread is not None and camera_thread.is_alive():
                 stop_camera_thread.set()
                 camera_thread.join(timeout=5)
@@ -447,14 +466,14 @@ def toggle_camera():
                         "error": "Previous camera thread is still running. "
                                  "Check PPS signal / camera USB and try again.",
                     }), 503
-            image_number = capture_sequence.last_saved_number(client_image_count)
+            image_number = amount_of_existing_images + 1
             stop_camera_thread.clear()
             _ensure_writer_thread()
             camera_thread = threading.Thread(
                 target=continuously_capture_images, name="camera-capture", daemon=True,
             )
             camera_thread.start()
-            print(f"Starting camera at {capture_sequence.files_for(image_number + 1).stem}")
+            print("Starting camera...")
         else:
             print("Stopping Camera")
             stop_camera_thread.set()
@@ -489,7 +508,10 @@ def _apply_manual_exposure(device: str, exposure_units: int) -> None:
         print(f"WARN: could not set manual exposure to {exposure_units} via v4l2-ctl")
 
 def _print_exposure_state(device: str) -> None:
-    """Log the camera's current exposure controls for verification."""
+    """Log the camera's current exposure controls for verification.
+    
+    THIS FUNCTION IS CURRENTLY UNUSED. IF WE NEED TO DEBUG EXPOSURE SETTINGS ON THE SPOT, CALL THIS!
+    """
     try:
         result = subprocess.run(
             ["v4l2-ctl", "-d", device, "--get-ctrl",
@@ -536,11 +558,13 @@ def continuously_capture_images():
         for _ in range(5):
             camera_connection.read()
 
+        # TODO: Remove this once we know the camera settings are solid.
         print("Camera opened with:")
         print("Width:", camera_connection.get(cv2.CAP_PROP_FRAME_WIDTH))
         print("Height:", camera_connection.get(cv2.CAP_PROP_FRAME_HEIGHT))
         print("FPS:", camera_connection.get(cv2.CAP_PROP_FPS))
-        _print_exposure_state(CAMERA_DEVICE)
+        print("Auto-exposure mode:", camera_connection.get(cv2.CAP_PROP_AUTO_EXPOSURE))
+        print("Exposure:", camera_connection.get(cv2.CAP_PROP_EXPOSURE))
         print("Gain:", camera_connection.get(cv2.CAP_PROP_GAIN))
 
     print("Camera ready, waiting for PPS pulses.")
@@ -568,7 +592,7 @@ def continuously_capture_images():
             take_picture(image_number, camera_connection, vehicle_data_snapshot)
     finally:
         os.close(pps_fd)
-        # Drain pending writes; the writer thread is shared and long-lived,
+        # Drain pending uploads; the writer thread is shared and long-lived,
         # so we do NOT send a poison pill here.
         _save_queue.join()
         if camera_connection is not None:
@@ -581,11 +605,17 @@ def take_picture(image_number, camera_connection, metadata):
         print(f"WARN: Failed to capture frame {image_number}")
         return
 
-    capture_files = capture_sequence.files_for(image_number)
-    print(f"DEBUG: Image {capture_files.stem} captured ({frame.shape[1]}x{frame.shape[0]}), queuing write")
+    # Encode frame to JPEG bytes in memory — no disk write
+    ret, buffer = cv2.imencode('.jpg', frame)
+    if not ret:
+        print(f"WARN: Failed to encode frame {image_number} as JPEG")
+        return
 
-    # Enqueue for async disk write — keeps the capture loop tight
-    _save_queue.put((capture_files, frame, metadata))
+    file_stem = f'{image_number:05d}'
+    print(f"DEBUG: Image {file_stem} captured ({frame.shape[1]}x{frame.shape[0]}), queuing upload")
+
+    # Enqueue for async HTTP upload — keeps the capture loop tight
+    _save_queue.put((file_stem, buffer.tobytes(), metadata))
 
 @app.route("/heartbeat-validate")
 def heartbeat_validate():
@@ -628,10 +658,8 @@ def receive_vehicle_position():  # Actively runs and receives live vehicle data 
                 print(f"WARN: failed to parse vehicle field: {e}")
 
 if __name__ == "__main__":
-    # Need to take a parameter off of the command line to determine if we are a plane or copter 
+    # Need to take a parameter off of the command line to determine if we are a plane or copter
     kit = ServoKit(channels=16)
-
-    os.makedirs(IMAGE_SAVE_DIR, exist_ok=True)
 
     position_thread = threading.Thread(target=receive_vehicle_position, daemon=True)
     position_thread.start()
