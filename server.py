@@ -415,8 +415,7 @@ def toggle_camera():
                     return jsonify({
                         "error": "Previous camera thread is still running. "
                                  "Check PPS signal / camera USB and try again.",
-                    }), 503
-            image_number = amount_of_existing_images + 1
+                    }), 503        
             stop_camera_thread.clear()
             camera_thread = threading.Thread(
                 target=continuously_capture_images, name="camera-capture", daemon=True,
