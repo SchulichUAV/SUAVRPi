@@ -7,7 +7,6 @@ from adafruit_servokit import ServoKit
 from io import BytesIO
 import cv2
 import threading
-import queue
 import requests
 import socket
 import ctypes
@@ -33,7 +32,7 @@ PPS_DEVICE = "/dev/pps0"  # kernel PPS driver via dtoverlay=pps-gpio,gpiopin=4
 GCS_URL - Depends which IP the laptop appears as on the network. Use ifconfig/ipconfig to check.
 CAMERA_DEVICE - Depends on which USB port the camera is plugged into. Check with `v4l2-ctl --list-devices` and look for the /dev/video* entry under the correct camera.
 '''
-GCS_URL = "http://192.168.1.65:80"
+GCS_URL = "http://192.168.1.66:80"
 CAMERA_DEVICE = "/dev/video0"
 
 # Manual exposure (shutter) settings. The camera is mounted on a moving
@@ -388,57 +387,6 @@ camera_thread = None
 camera_thread_lock = threading.Lock()
 stop_camera_thread = threading.Event()
 
-# Queue for offloading HTTP uploads from the timing-critical capture loop.
-# A single, long-lived writer thread is started at process startup so we
-# don't leak a new writer thread every time the camera is toggled.
-# Items are (file_stem, jpeg_bytes, metadata_dict).
-_save_queue: "queue.Queue" = queue.Queue()
-_writer_thread_started = False
-_writer_thread_lock = threading.Lock()
-
-def _image_writer():
-    """Background thread that drains _save_queue and POSTs images + metadata to the GCS."""
-    while True:
-        item = _save_queue.get()
-        try:
-            if item is None:  # poison pill (only used at process shutdown)
-                break
-            file_stem, jpeg_bytes, metadata = item
-            try:
-                # Send image
-                image_stream = BytesIO(jpeg_bytes)
-                response = requests.post(
-                    f"{GCS_URL}/submit",
-                    files={'file': (f'{file_stem}.jpg', image_stream, 'image/jpeg')},
-                    timeout=10,
-                )
-                if not response.ok:
-                    print(f"WARN: Image upload failed for {file_stem}: {response.status_code}")
-
-                # Send metadata
-                json_stream = BytesIO(json.dumps(metadata).encode('utf-8'))
-                response = requests.post(
-                    f"{GCS_URL}/submit",
-                    files={'file': (f'{file_stem}.json', json_stream, 'application/json')},
-                    timeout=10,
-                )
-                if not response.ok:
-                    print(f"WARN: Metadata upload failed for {file_stem}: {response.status_code}")
-
-            except requests.RequestException as e:
-                print(f"WARN: Failed to upload {file_stem}: {e}")
-        finally:
-            _save_queue.task_done()
-
-def _ensure_writer_thread() -> None:
-    """Start the singleton image-writer thread on first use."""
-    global _writer_thread_started
-    with _writer_thread_lock:
-        if _writer_thread_started:
-            return
-        threading.Thread(target=_image_writer, daemon=True, name="image-writer").start()
-        _writer_thread_started = True
-
 @app.route("/toggle_camera", methods=["POST"])
 def toggle_camera():
     global image_number
@@ -457,6 +405,8 @@ def toggle_camera():
     with camera_thread_lock:
         if requested_state:
             # Wait for any prior thread to finish before starting a new one.
+            # If it refuses to exit, refuse to start a new one rather than
+            # leaving two threads racing on the shared camera + PPS globals.
             if camera_thread is not None and camera_thread.is_alive():
                 stop_camera_thread.set()
                 camera_thread.join(timeout=5)
@@ -465,10 +415,8 @@ def toggle_camera():
                     return jsonify({
                         "error": "Previous camera thread is still running. "
                                  "Check PPS signal / camera USB and try again.",
-                    }), 503
-            image_number = amount_of_existing_images + 1
+                    }), 503        
             stop_camera_thread.clear()
-            _ensure_writer_thread()
             camera_thread = threading.Thread(
                 target=continuously_capture_images, name="camera-capture", daemon=True,
             )
@@ -592,9 +540,6 @@ def continuously_capture_images():
             take_picture(image_number, camera_connection, vehicle_data_snapshot)
     finally:
         os.close(pps_fd)
-        # Drain pending uploads; the writer thread is shared and long-lived,
-        # so we do NOT send a poison pill here.
-        _save_queue.join()
         if camera_connection is not None:
             camera_connection.release()
             camera_connection = None
@@ -612,10 +557,29 @@ def take_picture(image_number, camera_connection, metadata):
         return
 
     file_stem = f'{image_number:05d}'
-    print(f"DEBUG: Image {file_stem} captured ({frame.shape[1]}x{frame.shape[0]}), queuing upload")
+    print(f"DEBUG: Image {file_stem} captured ({frame.shape[1]}x{frame.shape[0]}), uploading")
 
-    # Enqueue for async HTTP upload — keeps the capture loop tight
-    _save_queue.put((file_stem, buffer.tobytes(), metadata))
+    try:
+        response = requests.post(
+            f"{GCS_URL}/submit",
+            files={'file': (f'{file_stem}.jpg', BytesIO(buffer.tobytes()), 'image/jpeg')},
+            timeout=10,
+        )
+        if not response.ok:
+            print(f"WARN: Image upload failed for {file_stem}: {response.status_code}")
+    except requests.RequestException as e:
+        print(f"WARN: Image upload error for {file_stem}: {e}")
+
+    try:
+        response = requests.post(
+            f"{GCS_URL}/submit",
+            files={'file': (f'{file_stem}.json', BytesIO(json.dumps(metadata).encode()), 'application/json')},
+            timeout=10,
+        )
+        if not response.ok:
+            print(f"WARN: Metadata upload failed for {file_stem}: {response.status_code}")
+    except requests.RequestException as e:
+        print(f"WARN: Metadata upload error for {file_stem}: {e}")
 
 @app.route("/heartbeat-validate")
 def heartbeat_validate():
