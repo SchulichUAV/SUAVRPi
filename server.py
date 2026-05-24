@@ -155,14 +155,7 @@ def set_altitude_goto():
 @app.route('/payload_drop_mission', methods=["POST"])
 def payload_drop_mission():
     try:
-        json_data = request.json
-        target_lat = float(json_data['latitude'])
-        target_lon = float(json_data['longitude'])
-        drop_altitude = 20 # 18m = 59ft - lowest allowed altitude is 50ft but want to be low for drops
-
-        payload_object_coord = [target_lat, target_lon, drop_altitude]
-
-        mission.upload_payload_drop_mission(vehicle_connection, payload_object_coord)
+        mission.upload_payload_drop_mission(vehicle_connection)
         print("Mission successfully uploaded.")
         return jsonify({'message': 'Mission uploaded successfully.'}), 200
             
@@ -175,7 +168,10 @@ def monitor_mission_and_drop():
     try:
         json_data = request.json
         bay = json_data['bay']
-        print(f"Initiating background monitor and drop for bay {bay}...")
+        print(f"Uploading mission and initiating background monitor and drop for bay {bay}...")
+
+        mission.upload_payload_drop_mission(vehicle_connection)
+        print("Mission successfully uploaded.")
 
         def monitor_and_drop():
             try:
@@ -185,22 +181,20 @@ def monitor_mission_and_drop():
                     if msg is not None and msg.seq == 2:  # Assuming seq 2 is the payload drop waypoint
                         autopilot_mode.set_mode(vehicle_connection, 10)  # Set to AUTO mode
                         break
-
                 # Drop the payload
                 mission.check_distance_and_drop(vehicle_connection, bay - 1, kit, vehicle_data)
                 print(f"Payload drop completed for bay {bay}")
             except Exception as drop_error:
                 print(f"[Background Thread] Error in mission drop: {drop_error}")
 
-        # Start thread
         thread = threading.Thread(target=monitor_and_drop)
         thread.start()
 
-    except Exception as e:
-        print(f"[Flask] Error starting monitor and drop thread: {e}")
-        return jsonify({'error': "Failed to start background drop task."}), 400
+        return jsonify({'success': True, 'message': f'Mission uploaded and monitor started for bay {bay}'}), 200
 
-    return jsonify({'message': 'Payload drop initiated in background'}), 200
+    except Exception as e:
+        print(f"Error: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 400
 
 @app.route('/payload_manual_control', methods=["POST"])
 def payload_manual_control():
