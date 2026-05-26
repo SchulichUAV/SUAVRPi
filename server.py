@@ -32,7 +32,7 @@ PPS_DEVICE = "/dev/pps0"  # kernel PPS driver via dtoverlay=pps-gpio,gpiopin=4
 GCS_URL - Depends which IP the laptop appears as on the network. Use ifconfig/ipconfig to check.
 CAMERA_DEVICE - Depends on which USB port the camera is plugged into. Check with `v4l2-ctl --list-devices` and look for the /dev/video* entry under the correct camera.
 '''
-GCS_URL = "http://192.168.1.66:80"
+GCS_URL = "http://192.168.1.65:80"
 CAMERA_DEVICE = "/dev/video0"
 
 # Manual exposure (shutter) settings. The camera is mounted on a moving
@@ -182,7 +182,7 @@ def monitor_mission_and_drop():
                         autopilot_mode.set_mode(vehicle_connection, 10)  # Set to AUTO mode
                         break
                 # Drop the payload
-                mission.check_distance_and_drop(vehicle_connection, bay - 1, kit, vehicle_data)
+                mission.check_distance_and_drop(vehicle_connection, 0, kit, vehicle_data)
                 print(f"Payload drop completed for bay {bay}")
             except Exception as drop_error:
                 print(f"[Background Thread] Error in mission drop: {drop_error}")

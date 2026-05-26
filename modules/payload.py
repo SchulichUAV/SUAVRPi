@@ -58,14 +58,15 @@ def release_all(kit, vehicle_data):
 def close_servo(kit, servo_num):
     try:
         kit.servo[servo_map[servo_num]].angle = close_angle
-        print("Successfully closed servo.")
+        print(f"[DEBUG] Closed servo: {servo_num}")
     except Exception as e:
         print(f"Could not close servo. Error: {e}")
 
 def open_servo(kit, servo_num):
+    print(f"[DEBUG] Open servo call for servo {servo_num}")
     try:
         kit.servo[servo_map[servo_num]].angle = open_angle
-        print("Successfully opened servo.")
+        print(f"[DEBUG] Successfully opened servo: {servo_num}")
     except Exception as e:
         print(f"Could not open servo. Error: {e}")
 
