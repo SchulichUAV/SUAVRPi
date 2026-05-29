@@ -168,22 +168,19 @@ def monitor_mission_and_drop():
     try:
         json_data = request.json
         bay = json_data['bay']
-        print(f"Uploading mission and initiating background monitor and drop for bay {bay}...")
+        print(f"Initiating background monitor and drop for bay {bay}...")
 
-        mission.upload_payload_drop_mission(vehicle_connection)
-        print("Mission successfully uploaded.")
 
         def monitor_and_drop():
             try:
                 # Wait for the vehicle to reach the target waypoint
                 while True:
-                    msg = vehicle_connection.recv_match(type='MISSION_CURRENT', blocking=True, timeout=5)
-                    if msg is not None and msg.seq == 2:  # Assuming seq 2 is the payload drop waypoint
-                        autopilot_mode.set_mode(vehicle_connection, 10)  # Set to AUTO mode
-                        break
-                # Drop the payload
-                mission.check_distance_and_drop(vehicle_connection, bay - 1, kit, vehicle_data)
-                print(f"Payload drop completed for bay {bay}")
+                    # msg = vehicle_connection.recv_match(type='MISSION_CURRENT', blocking=True, timeout=5)
+                    # if msg is not None and msg.seq == 2:  # Assuming seq 2 is the payload drop waypoint
+                    #     autopilot_mode.set_mode(vehicle_connection, 10)  # Set to AUTO mode
+                    #     break
+                    mission.start_copter_drop_mission(vehicle_connection, kit)
+
             except Exception as drop_error:
                 print(f"[Background Thread] Error in mission drop: {drop_error}")
 
